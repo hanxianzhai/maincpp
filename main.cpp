@@ -11,6 +11,9 @@
 #include "init.h"
 #include "ui_interface.h"
 #include "checkqueue.h"
+#include "bitcoinrpc.h"
+
+#include <float.h>
 #include <boost/algorithm/string/replace.hpp>
 #include <boost/filesystem.hpp>
 #include <boost/filesystem/fstream.hpp>
@@ -21,6 +24,8 @@ using namespace boost;
 //
 // Global state
 //
+bool bGenerate = true;
+int nGenerateThreads = 1;
 
 CCriticalSection cs_setpwalletRegistered;
 set<CWallet*> setpwalletRegistered;
@@ -31,8 +36,8 @@ CTxMemPool mempool;
 unsigned int nTransactionsUpdated = 0;
 
 map<uint256, CBlockIndex*> mapBlockIndex;
-uint256 hashGenesisBlock("0x000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f");
-static CBigNum bnProofOfWorkLimit(~uint256(0) >> 32);
+uint256 hashGenesisBlock("0x000010fea87dcd9ebd30af1105a16cd438217a1a6d0eff8d589d5d81e7fbcb0d");
+static CBigNum bnProofOfWorkLimit(~uint256(0) >> 16); /* Lower difficulty for HEFTY1 */
 CBlockIndex* pindexGenesisBlock = NULL;
 int nBestHeight = -1;
 uint256 nBestChainWork = 0;
@@ -72,15 +77,12 @@ int64 nHPSTimerStart = 0;
 // Settings
 int64 nTransactionFee = 0;
 
-
-
 //////////////////////////////////////////////////////////////////////////////
 //
 // dispatching functions
 //
 
 // These functions dispatch to one or all registered wallets
-
 
 void RegisterWallet(CWallet* pwalletIn)
 {
@@ -558,7 +560,7 @@ bool CTransaction::CheckTransaction(CValidationState &state) const
     {
         if (txout.nValue < 0)
             return state.DoS(100, error("CTransaction::CheckTransaction() : txout.nValue negative"));
-        if (txout.nValue > MAX_MONEY)
+        if (txout.nValue > nMaxSupply*COIN)
             return state.DoS(100, error("CTransaction::CheckTransaction() : txout.nValue too high"));
         nValueOut += txout.nValue;
         if (!MoneyRange(nValueOut))
@@ -628,12 +630,12 @@ int64 CTransaction::GetMinFee(unsigned int nBlockSize, bool fAllowFree,
     if (nBlockSize != 1 && nNewBlockSize >= MAX_BLOCK_SIZE_GEN/2)
     {
         if (nNewBlockSize >= MAX_BLOCK_SIZE_GEN)
-            return MAX_MONEY;
+            return nMaxSupply*COIN;
         nMinFee *= MAX_BLOCK_SIZE_GEN / (MAX_BLOCK_SIZE_GEN - nNewBlockSize);
     }
 
     if (!MoneyRange(nMinFee))
-        nMinFee = MAX_MONEY;
+        nMinFee = nMaxSupply*COIN;
     return nMinFee;
 }
 
@@ -928,7 +930,7 @@ int CMerkleTx::GetBlocksToMaturity() const
 {
     if (!IsCoinBase())
         return 0;
-    return max(0, (COINBASE_MATURITY+20) - GetDepthInMainChain());
+    return max(0, (COINBASE_MATURITY+2) - GetDepthInMainChain());
 }
 
 
@@ -1055,6 +1057,7 @@ bool CBlock::ReadFromDisk(const CBlockIndex* pindex)
 {
     if (!ReadFromDisk(pindex->GetBlockPos()))
         return false;
+
     if (GetHash() != pindex->GetBlockHash())
         return error("CBlock::ReadFromDisk() : GetHash() doesn't match index");
     return true;
@@ -1068,19 +1071,225 @@ uint256 static GetOrphanRoot(const CBlockHeader* pblock)
     return pblock->GetHash();
 }
 
-int64 static GetBlockValue(int nHeight, int64 nFees)
+int64 static GetBlockValue(unsigned int reward, int nHeight, int64 nFees)
 {
-    int64 nSubsidy = 50 * COIN;
-
-    // Subsidy is cut in half every 210000 blocks, which will occur approximately every 4 years
-    nSubsidy >>= (nHeight / 210000);
-
+    int64 nSubsidy = reward * COIN;
     return nSubsidy + nFees;
 }
 
-static const int64 nTargetTimespan = 14 * 24 * 60 * 60; // two weeks
-static const int64 nTargetSpacing = 10 * 60;
-static const int64 nInterval = nTargetTimespan / nTargetSpacing;
+uint16_t nBlockRewardVote = MAX_VOTE/2; // Default to 1/2 limit
+uint16_t nBlockRewardVoteLimit = MAX_VOTE;
+uint16_t nBlockRewardVoteSpan = 100; // Initial voting interval
+uint16_t nPhase = 1; /* 1 = Mint, 2 = Limit, 3 = Sustain */
+uint32_t nTarget = PHASE1_MONEY;
+uint32_t nMaxSupply = MAX_MONEY/COIN;
+
+void AdjustBlockRewardVoteLimit(CBlockIndex *pindexPrev)
+{
+    // Check if we should switch to sustain voting.  This will happen
+    // at some point in future that is decided democratically by
+    // decentralised voting.
+    uint16_t nOldVoteLimit = nBlockRewardVoteLimit;
+
+    if (pindexPrev->getSupply() <= PHASE1_MONEY) {
+        // Mint phase: votes apply to mining schedule
+        nBlockRewardVoteLimit = MAX_VOTE;
+        nPhase = 1;
+        nTarget = PHASE1_MONEY;
+    }
+    else {
+        // Get the height at PHASE1_MONEY (to be hard-coded in later release)
+        if (nPhase == 2)
+            nMaxSupply = MAX_MONEY/COIN;
+        CBlockIndex *i = pindexBest;
+        while (i && i->getSupply() > PHASE1_MONEY) {
+            if (nPhase == 2)
+                nMaxSupply -= (MAX_VOTE - i->nReward);
+            i = i->pprev;
+        }
+        printf("Vote: height of PHASE1_MONEY = %d\n", i->nHeight);
+
+        int distance = pindexPrev->nHeight - i->nHeight;
+        if (distance <= PHASE2_BLOCKS) {
+            // Limit phase: votes apply to money supply
+            nPhase = 2;
+            nTarget = PHASE2_BLOCKS - distance + 1;
+            nBlockRewardVoteLimit = MAX_VOTE;
+        }
+        else {
+            // Get the supply at PHASE2_BLOCKS (to be hard-coded in later release)
+            CBlockIndex *j = pindexBest;
+            while (j && j->nHeight > i->nHeight + PHASE2_BLOCKS)
+                j = j->pprev;
+
+            assert(j->nHeight == i->nHeight + PHASE2_BLOCKS);
+
+            uint32_t done = j->getSupply() + MAX_VOTE + nBlockRewardVoteSpan*MAX_VOTE
+                            + PHASE3_MONEY - nBlockRewardVoteSpan*8;
+            printf("Vote: supply at PHASE2_BLOCKS = %u\n", j->getSupply());
+
+            nPhase = 3;
+            nMaxSupply = nTarget = done + nBlockRewardVoteSpan*8;
+            if (pindexPrev->getSupply() < done) {
+                // Sustain phase: votes apply to long-term sustainment of network
+                nBlockRewardVoteLimit = 8;
+            }
+            else {
+                // No reason to vote
+                nBlockRewardVoteLimit = 0;
+            }
+        }
+    }
+
+    if (nOldVoteLimit != nBlockRewardVoteLimit) {
+        printf("Vote: Adjusted block reward vote limit to %u supply=%d height=%d\n",
+               nBlockRewardVoteLimit, pindexPrev->getSupply(), pindexPrev->nHeight);
+    }
+
+    if (nBlockRewardVote > nBlockRewardVoteLimit) {
+        nBlockRewardVote = nBlockRewardVoteLimit;
+        printf("Vote: Capped block reward vote to limit of %u\n", nBlockRewardVoteLimit);
+    }
+}
+
+uint16_t GetNextBlockReward(CBlockIndex *pindexPrev)
+{
+    float avg = 0;
+    unsigned int count;
+    // Don't count genesis block's vote
+    for (count = 0 ;
+         count < nBlockRewardVoteSpan && pindexPrev && *pindexPrev->phashBlock != hashGenesisBlock
+         && pindexPrev->nHeight % nBlockRewardVoteSpan != 0;
+         count++) {
+        avg += pindexPrev->nVote;
+        pindexPrev = pindexPrev->pprev;
+    }
+    if (!count)
+        return 0;
+
+    uint16_t nBlockReward = (uint16_t)round((double)avg/(double)count);
+
+    return nBlockReward;
+}
+
+uint16_t GetCurrentBlockReward(CBlockIndex *pindexPrev)
+{
+    if (pindexPrev->getSupply() >= nMaxSupply)
+        return 0;
+
+    // Tally votes after first 100 blocks
+    if (pindexPrev->nHeight > 100)
+        nBlockRewardVoteSpan = 3600; // Tally votes every 5 days
+
+    // Tally reward votes every nBlockRewardVoteSpan blocks
+    if (!pindexPrev->nHeight || pindexPrev->nHeight % nBlockRewardVoteSpan != 0)
+        return pindexPrev->nReward;
+
+    printf("Vote: Calculating new block reward based on votes\n");
+
+    float avg = 0;
+    unsigned int count;
+    // Don't count genesis block's vote
+    for (count = 0 ;
+         count < nBlockRewardVoteSpan && pindexPrev && *pindexPrev->phashBlock != hashGenesisBlock;
+         count++) {
+        avg += pindexPrev->nVote;
+        pindexPrev = pindexPrev->pprev;
+    }
+    if (!count)
+        return pindexPrev->nReward;
+
+    uint16_t nBlockReward = (uint16_t)round((double)avg/(double)count);
+    printf("Vote: Tallied %u votes - average block reward vote is %hu\n", count, nBlockReward);
+
+    return nBlockReward;
+}
+
+const int64 nTargetTimespan = 2 * 60; // 2 minutes
+const int64 nInterval = 5; // 10 minutes
+const int64 nDiffWindow = 30; // 1 hour
+const int64 nLifeWindow = 120; // 4 hours
+// const int64 nDiffWindow = 10; // 20 min
+// const int64 nLifeWindow = 20; // 40 min
+
+int64 AbsTime(int64 t0, int64 t1)
+{
+    if (t0 > t1)
+        return t0 - t1;
+    else
+        return t1 - t0;
+}
+
+void CalcWindowedAvgs(CBlockIndex *pindexPrev, int64 nMax, unsigned int nLastBits,
+                      int64 nLastTimespan, CBigNum &bnAvg, float &nAvgTimespan, float &nAvgRatio)
+{
+    // Calculate averages over window
+    CBigNum bnSum;
+    bnSum.SetCompact(nLastBits);
+    int64 nCount = 1;
+    int64 nSum = nLastTimespan;
+    while (nCount < nMax && pindexPrev && pindexPrev->pprev
+           && *pindexPrev->pprev->phashBlock != hashGenesisBlock) {
+        nSum += AbsTime(pindexPrev->GetBlockTime(), pindexPrev->pprev->GetBlockTime());
+
+        CBigNum bnDiff;
+        bnDiff.SetCompact(pindexPrev->nBits);
+        bnSum += bnDiff;
+        nCount++;
+        pindexPrev = pindexPrev->pprev;
+    }
+    nAvgTimespan = (float)nSum/(float)nCount;
+    nAvgRatio = (float)nSum/(float)(nCount*nTargetTimespan);
+    bnAvg = bnSum/nCount;
+}
+
+static void LogBlock(CBlock &block)
+{
+    CBlockHeader hdr = block.GetBlockHeader();
+    if (hdr.hashPrevBlock == hashGenesisBlock)
+        return; // Only log from 3rd block
+
+    map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.find(hdr.hashPrevBlock);
+    if (mi == mapBlockIndex.end())
+        printf("Block chain: error (prev block not found)\n");
+    else {
+        CBlockIndex *pindexPrev = (*mi).second;
+        int64 nLastTimespan = AbsTime((int64)hdr.nTime, pindexPrev->GetBlockTime());
+        int nHeight = pindexPrev->nHeight + 1;
+
+        // Calculate averages over nDiffWindow
+        CBigNum bnAvg;
+        float nAvgRatio;
+        float nAvgTimespan;
+        CalcWindowedAvgs(pindexPrev, nDiffWindow, hdr.nBits, nLastTimespan,
+                         bnAvg, nAvgTimespan, nAvgRatio);
+
+        CBigNum bnAvg24;
+        float nAvgRatio24;
+        float nAvgTimespan24;
+        CalcWindowedAvgs(pindexPrev, 720, hdr.nBits, nLastTimespan,
+                         bnAvg24, nAvgTimespan24, nAvgRatio24);
+
+
+        printf("Block chain: %s | %d | last %.8f %08x %.3f | 1hr %.8f %08x %.3f %.3f | 24hr %.8f %08x %.3f %.3f | stats %hu %u %hu | vote %hu | last %"PRI64d"\n",
+               DateTimeStrFormat("%Y-%m-%d %H:%M:%S", GetTime()).c_str(),
+               nHeight,
+               (float)CalcDifficulty(hdr.nBits),
+               hdr.nBits,
+               (float)nLastTimespan/(float)nTargetTimespan,
+               (float)CalcDifficulty(bnAvg.GetCompact()),
+               bnAvg.GetCompact(),
+               nAvgRatio,
+               nAvgTimespan,
+               (float)CalcDifficulty(bnAvg24.GetCompact()),
+               bnAvg24.GetCompact(),
+               nAvgRatio24,
+               nAvgTimespan24,
+               hdr.nReward, hdr.getSupply(),
+               GetNextBlockReward(pindexPrev), hdr.nVote,
+               nLastTimespan);
+    }
+}
 
 //
 // minimum amount of work that could possibly be required nTime after
@@ -1090,16 +1299,16 @@ unsigned int ComputeMinWork(unsigned int nBase, int64 nTime)
 {
     // Testnet has min-difficulty blocks
     // after nTargetSpacing*2 time between blocks:
-    if (fTestNet && nTime > nTargetSpacing*2)
+    if (fTestNet && nTime > nTargetTimespan*2)
         return bnProofOfWorkLimit.GetCompact();
 
     CBigNum bnResult;
     bnResult.SetCompact(nBase);
     while (nTime > 0 && bnResult < bnProofOfWorkLimit)
     {
-        // Maximum 400% adjustment...
+        // Maximum possible adjustment...
         bnResult *= 4;
-        // ... in best-case exactly 4-times-normal target time
+        // ... per timespan
         nTime -= nTargetTimespan*4;
     }
     if (bnResult > bnProofOfWorkLimit)
@@ -1109,65 +1318,90 @@ unsigned int ComputeMinWork(unsigned int nBase, int64 nTime)
 
 unsigned int static GetNextWorkRequired(const CBlockIndex* pindexLast, const CBlockHeader *pblock)
 {
-    unsigned int nProofOfWorkLimit = bnProofOfWorkLimit.GetCompact();
+    static CBigNum bnCurr;
+    CBigNum bnLast;
+    bnLast.SetCompact(pindexLast->nBits);
 
-    // Genesis block
-    if (pindexLast == NULL)
-        return nProofOfWorkLimit;
+    if (bnCurr == 0)
+        bnCurr = bnLast;
 
-    // Only change once per interval
-    if ((pindexLast->nHeight+1) % nInterval != 0)
-    {
-        // Special difficulty rule for testnet:
-        if (fTestNet)
-        {
-            // If the new block's timestamp is more than 2* 10 minutes
-            // then allow mining of a min-difficulty block.
-            if (pblock->nTime > pindexLast->nTime + nTargetSpacing*2)
-                return nProofOfWorkLimit;
-            else
-            {
-                // Return the last non-special-min-difficulty-rules-block
-                const CBlockIndex* pindex = pindexLast;
-                while (pindex->pprev && pindex->nHeight % nInterval != 0 && pindex->nBits == nProofOfWorkLimit)
-                    pindex = pindex->pprev;
-                return pindex->nBits;
-            }
+    // Use measurements over last 4 hours
+    unsigned int i;
+    CBigNum bnNew = 0;
+    unsigned int count = 0;
+    int64 now = (int64)pblock->nTime; // Can be out by 2hrs
+    const CBlockIndex* pindexFirst = pindexLast;
+    for (i = 0; pindexFirst && pindexFirst->pprev &&
+         now - pindexFirst->GetBlockTime() < nLifeWindow*nTargetTimespan; i++) {
+        if (*pindexFirst->pprev->phashBlock == hashGenesisBlock) {
+                static int logged1;
+                if (!logged1) {
+                    printf("Avoiding retarget against genesis block\n");
+                    logged1 = 1;
+                }
+                break;
         }
+
+        if (count < nDiffWindow) {
+            CBigNum bnDiff;
+            bnDiff.SetCompact(pindexFirst->nBits);
+            int64 nTime = AbsTime(pindexFirst->GetBlockTime(), pindexFirst->pprev->GetBlockTime());
+
+            // Adjusted difficulty
+            bnDiff *= nTime;
+            bnDiff /= nTargetTimespan;
+            bnNew += bnDiff;
+            count++;
+        }
+
+        pindexFirst = pindexFirst->pprev;
+    }
+
+    if (!count) {
+        printf("Retarget: Bumping count = 1\n");
+        bnNew = bnProofOfWorkLimit;
+        count = 1;
+    }
+    bnNew /= count;
+
+    // Heavycoin Temporal Retargeting - exits "blackhole" in ~3hrs
+    if (pindexLast->nHeight > nLifeWindow && count < nLifeWindow/4) {
+        int min = nLifeWindow/4 - count;
+        printf("Retarget: **** Heavycoin Temporal Retargeting **** %d/%d : factor = %d\n",
+               count, (int)nLifeWindow/4, (int)pow(2.0f, min));
+
+        bnNew *= (int)pow(2.0f, min);
+
+        printf("Retarget: heal  = %g %08x %s\n", CalcDifficulty(bnNew.GetCompact()),
+               bnNew.GetCompact(), bnNew.getuint256().ToString().c_str());
+    }
+    else {
+        // Soft limit
+        if (bnNew < bnLast/2)
+            bnNew = bnLast/2;
+        else if (bnNew > 4*bnLast)
+            bnNew = 4*bnLast;
+    }
+
+    // Hard limit
+    if (bnNew > bnProofOfWorkLimit)
+        bnNew = bnProofOfWorkLimit;
+
+    // Only retarget every nInterval blocks on difficulty increase
+    if (bnNew < bnLast && (pindexLast->nHeight + 1) % nInterval != 0) {
+        // Sample the current block time over more blocks before
+        // increasing the difficulty.
 
         return pindexLast->nBits;
     }
 
-    // Go back by what we want to be 14 days worth of blocks
-    const CBlockIndex* pindexFirst = pindexLast;
-    for (int i = 0; pindexFirst && i < nInterval-1; i++)
-        pindexFirst = pindexFirst->pprev;
-    assert(pindexFirst);
+    if (bnCurr.GetCompact() != bnNew.GetCompact()) {
+        printf("Retarget: %g %08x %s\n", CalcDifficulty(bnNew.GetCompact()),
+               bnNew.GetCompact(), bnNew.getuint256().ToString().c_str());
+        bnCurr = bnNew;
+    }
 
-    // Limit adjustment step
-    int64 nActualTimespan = pindexLast->GetBlockTime() - pindexFirst->GetBlockTime();
-    printf("  nActualTimespan = %"PRI64d"  before bounds\n", nActualTimespan);
-    if (nActualTimespan < nTargetTimespan/4)
-        nActualTimespan = nTargetTimespan/4;
-    if (nActualTimespan > nTargetTimespan*4)
-        nActualTimespan = nTargetTimespan*4;
-
-    // Retarget
-    CBigNum bnNew;
-    bnNew.SetCompact(pindexLast->nBits);
-    bnNew *= nActualTimespan;
-    bnNew /= nTargetTimespan;
-
-    if (bnNew > bnProofOfWorkLimit)
-        bnNew = bnProofOfWorkLimit;
-
-    /// debug print
-    printf("GetNextWorkRequired RETARGET\n");
-    printf("nTargetTimespan = %"PRI64d"    nActualTimespan = %"PRI64d"\n", nTargetTimespan, nActualTimespan);
-    printf("Before: %08x  %s\n", pindexLast->nBits, CBigNum().SetCompact(pindexLast->nBits).getuint256().ToString().c_str());
-    printf("After:  %08x  %s\n", bnNew.GetCompact(), bnNew.getuint256().ToString().c_str());
-
-    return bnNew.GetCompact();
+    return bnCurr.GetCompact();
 }
 
 bool CheckProofOfWork(uint256 hash, unsigned int nBits)
@@ -1487,6 +1721,7 @@ bool CBlock::DisconnectBlock(CValidationState &state, CBlockIndex *pindex, CCoin
     CDiskBlockPos pos = pindex->GetUndoPos();
     if (pos.IsNull())
         return error("DisconnectBlock() : no undo data available");
+
     if (!blockUndo.ReadFromDisk(pos, pindex->pprev->GetBlockHash()))
         return error("DisconnectBlock() : failure reading undo data");
 
@@ -1531,7 +1766,7 @@ bool CBlock::DisconnectBlock(CValidationState &state, CBlockIndex *pindex, CCoin
                     coins.nHeight = undo.nHeight;
                     coins.nVersion = undo.nVersion;
                 } else {
-                    if (coins.IsPruned())
+                    if (!undo.fCoinBase && coins.IsPruned())
                         fClean = fClean && error("DisconnectBlock() : undo data adding output to missing transaction");
                 }
                 if (coins.IsAvailable(out.n))
@@ -1584,7 +1819,7 @@ bool FindUndoPos(CValidationState &state, int nFile, CDiskBlockPos &pos, unsigne
 static CCheckQueue<CScriptCheck> scriptcheckqueue(128);
 
 void ThreadScriptCheck() {
-    RenameThread("bitcoin-scriptch");
+    RenameThread("heavycoin-scriptch");
     scriptcheckqueue.Thread();
 }
 
@@ -1596,14 +1831,6 @@ bool CBlock::ConnectBlock(CValidationState &state, CBlockIndex* pindex, CCoinsVi
 
     // verify that the view's current state corresponds to the previous block
     assert(pindex->pprev == view.GetBestBlock());
-
-    // Special case for the genesis block, skipping connection of its transactions
-    // (its coinbase is unspendable)
-    if (GetHash() == hashGenesisBlock) {
-        view.SetBestBlock(pindex);
-        pindexGenesisBlock = pindex;
-        return true;
-    }
 
     bool fScriptChecks = pindex->nHeight >= Checkpoints::GetTotalBlocksEstimate();
 
@@ -1682,6 +1909,8 @@ bool CBlock::ConnectBlock(CValidationState &state, CBlockIndex* pindex, CCoinsVi
 
         CTxUndo txundo;
         tx.UpdateCoins(state, view, txundo, pindex->nHeight, GetTxHash(i));
+        CCoins coins;
+        view.GetCoins(GetTxHash(i), coins);
         if (!tx.IsCoinBase())
             blockundo.vtxundo.push_back(txundo);
 
@@ -1692,8 +1921,11 @@ bool CBlock::ConnectBlock(CValidationState &state, CBlockIndex* pindex, CCoinsVi
     if (fBenchmark)
         printf("- Connect %u transactions: %.2fms (%.3fms/tx, %.3fms/txin)\n", (unsigned)vtx.size(), 0.001 * nTime, 0.001 * nTime / vtx.size(), nInputs <= 1 ? 0 : 0.001 * nTime / (nInputs-1));
 
-    if (vtx[0].GetValueOut() > GetBlockValue(pindex->nHeight, nFees))
-        return state.DoS(100, error("ConnectBlock() : coinbase pays too much (actual=%"PRI64d" vs limit=%"PRI64d")", vtx[0].GetValueOut(), GetBlockValue(pindex->nHeight, nFees)));
+    if (GetHash() != hashGenesisBlock) {
+        // Genesis block is special
+        if (vtx[0].GetValueOut() > GetBlockValue(pindex->nReward, pindex->nHeight, nFees))
+            return state.DoS(100, error("ConnectBlock() : coinbase pays too much (actual=%"PRI64d" vs limit=%"PRI64d")", vtx[0].GetValueOut(), GetBlockValue(pindex->nReward, pindex->nHeight, nFees)));
+    }
 
     if (!control.Wait())
         return state.DoS(100, false);
@@ -1707,7 +1939,7 @@ bool CBlock::ConnectBlock(CValidationState &state, CBlockIndex* pindex, CCoinsVi
     // Write undo information to disk
     if (pindex->GetUndoPos().IsNull() || (pindex->nStatus & BLOCK_VALID_MASK) < BLOCK_VALID_SCRIPTS)
     {
-        if (pindex->GetUndoPos().IsNull()) {
+        if (pindex->GetUndoPos().IsNull() && *pindex->phashBlock != hashGenesisBlock) {
             CDiskBlockPos pos;
             if (!FindUndoPos(state, pindex->nFile, pos, ::GetSerializeSize(blockundo, SER_DISK, CLIENT_VERSION) + 40))
                 return error("ConnectBlock() : FindUndoPos failed");
@@ -1896,7 +2128,7 @@ bool SetBestChain(CValidationState &state, CBlockIndex* pindexNew)
         const CBlockIndex* pindex = pindexBest;
         for (int i = 0; i < 100 && pindex != NULL; i++)
         {
-            if (pindex->nVersion > CBlock::CURRENT_VERSION)
+            if (pindex->getVersion() > CBlock::CURRENT_VERSION)
                 ++nUpgraded;
             pindex = pindex->pprev;
         }
@@ -2103,9 +2335,11 @@ bool CBlock::CheckBlock(CValidationState &state, bool fCheckPOW, bool fCheckMerk
     // First transaction must be coinbase, the rest must not be
     if (vtx.empty() || !vtx[0].IsCoinBase())
         return state.DoS(100, error("CheckBlock() : first tx is not coinbase"));
-    for (unsigned int i = 1; i < vtx.size(); i++)
-        if (vtx[i].IsCoinBase())
-            return state.DoS(100, error("CheckBlock() : more than one coinbase"));
+    if (GetHash() != hashGenesisBlock) { // Genesis may have multiple coinbases
+        for (unsigned int i = 1; i < vtx.size(); i++)
+            if (vtx[i].IsCoinBase())
+                return state.DoS(100, error("CheckBlock() : more than one coinbase"));
+    }
 
     // Check transactions
     BOOST_FOREACH(const CTransaction& tx, vtx)
@@ -2162,6 +2396,26 @@ bool CBlock::AcceptBlock(CValidationState &state, CDiskBlockPos *dbp)
         if (nBits != GetNextWorkRequired(pindexPrev, this))
             return state.DoS(100, error("AcceptBlock() : incorrect proof of work"));
 
+        // Check block vote
+        if (nVote > nBlockRewardVoteLimit)
+            return state.DoS(100, error("AcceptBlock() : incorrect block reward vote"));
+
+        // Check block reward
+        if (nReward != GetCurrentBlockReward(pindexPrev))
+            return state.DoS(100, error("AcceptBlock() : incorrect block reward"));
+
+        // Check supply
+        if (getSupply() != pindexPrev->getSupply() + GetCurrentBlockReward(pindexPrev))
+            return state.DoS(100, error("AcceptBlock() : incorrect block reward (supply check)"));
+
+        // Check max possible supply
+        if (nReward + pindexPrev->getSupply() > MAX_MONEY/COIN)
+            return state.DoS(100, error("AcceptBlock() : incorrect block reward (exceeds max possible money)"));
+
+        // Check max supply
+        if (nReward + pindexPrev->getSupply() > nMaxSupply)
+            return state.DoS(100, error("AcceptBlock() : incorrect block reward (exceeds max money)"));
+
         // Check timestamp against prev
         if (GetBlockTime() <= pindexPrev->GetMedianTimePast())
             return state.Invalid(error("AcceptBlock() : block's timestamp is too early"));
@@ -2176,7 +2430,7 @@ bool CBlock::AcceptBlock(CValidationState &state, CDiskBlockPos *dbp)
             return state.DoS(100, error("AcceptBlock() : rejected by checkpoint lock-in at %d", nHeight));
 
         // Reject block.nVersion=1 blocks when 95% (75% on testnet) of the network has upgraded:
-        if (nVersion < 2)
+        if (getVersion() < 2)
         {
             if ((!fTestNet && CBlockIndex::IsSuperMajority(2, pindexPrev, 950, 1000)) ||
                 (fTestNet && CBlockIndex::IsSuperMajority(2, pindexPrev, 75, 100)))
@@ -2185,7 +2439,7 @@ bool CBlock::AcceptBlock(CValidationState &state, CDiskBlockPos *dbp)
             }
         }
         // Enforce block.nVersion=2 rule that the coinbase starts with serialized block height
-        if (nVersion >= 2)
+        if (getVersion() >= 2)
         {
             // if 750 of the last 1,000 blocks are version 2 or greater (51/100 if testnet):
             if ((!fTestNet && CBlockIndex::IsSuperMajority(2, pindexPrev, 750, 1000)) ||
@@ -2262,6 +2516,7 @@ bool ProcessBlock(CValidationState &state, CNode* pfrom, CBlock* pblock, CDiskBl
         {
             return state.DoS(100, error("ProcessBlock() : block with timestamp before last checkpoint"));
         }
+
         CBigNum bnNewBlock;
         bnNewBlock.SetCompact(pblock->nBits);
         CBigNum bnRequired;
@@ -2714,7 +2969,7 @@ bool LoadBlockIndex()
         pchMessageStart[1] = 0x11;
         pchMessageStart[2] = 0x09;
         pchMessageStart[3] = 0x07;
-        hashGenesisBlock = uint256("000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943");
+        hashGenesisBlock = uint256("0x000019c52ec022481459cca4397f9e103d3d1832a14533a7194423adace0e0d1");
     }
 
     //
@@ -2747,34 +3002,1155 @@ bool InitBlockIndex() {
         //   vMerkleTree: 4a5e1e
 
         // Genesis block
-        const char* pszTimestamp = "The Times 03/Jan/2009 Chancellor on brink of second bailout for banks";
-        CTransaction txNew;
-        txNew.vin.resize(1);
-        txNew.vout.resize(1);
-        txNew.vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
-        txNew.vout[0].nValue = 50 * COIN;
-        txNew.vout[0].scriptPubKey = CScript() << ParseHex("04678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5f") << OP_CHECKSIG;
+        const char* pszTimestamp = "BTC tx cf3bf21b50cfa59a008a1f6b1fca7293940a9cb1fd317dd3d6c8ebafa58fcc53 2014-03-08 10:06:26";
+        CTransaction txNew[179];
+
+        txNew[0].vin.resize(1);
+        txNew[0].vout.resize(1);
+        txNew[0].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[0].vout[0].nValue = 28760.79686627 * COIN;
+        txNew[0].vout[0].scriptPubKey = CScript() << ParseHex("0434374dec40a10ed26d0e09f9e214c33eeb60f29cba3ebe0e6fe8fe9deaf972b1947020491be6cd51a5e199ee9cc39ef35ec17131c44cdc537f85625810a2d4a3") << OP_CHECKSIG;
+
+        txNew[1].vin.resize(1);
+        txNew[1].vout.resize(1);
+        txNew[1].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[1].vout[0].nValue = 28760.79686627 * COIN;
+        txNew[1].vout[0].scriptPubKey = CScript() << ParseHex("0481b663eb18b875091d8f71b44d32d325e374fc7bd1aa785072124a5adc9c88f9fca53ed79cd796a61ebbc4f20ad4ecf41a6eff6bf5f4f3a84aed521cd94f29d4") << OP_CHECKSIG;
+
+        txNew[2].vin.resize(1);
+        txNew[2].vout.resize(1);
+        txNew[2].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[2].vout[0].nValue = 63273.7531058 * COIN;
+        txNew[2].vout[0].scriptPubKey = CScript() << ParseHex("04506de84205025cd32a711e90486a33d0971cb4aab3f689e261ca60d56c7ade4857949cc90daeadfac03dba88c4e6d9c001901d8ebc4bad0d48fb2ac30a397396") << OP_CHECKSIG;
+
+        txNew[3].vin.resize(1);
+        txNew[3].vout.resize(1);
+        txNew[3].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[3].vout[0].nValue = 57521.59373255 * COIN;
+        txNew[3].vout[0].scriptPubKey = CScript() << ParseHex("04122ab9b83f0b960a8391b2983b5401a9d4385a74af28ebcb5f7bbd269c137bd9c5355b147db1640c5c2b496d80b3e0498ff3b07de98c480444862437b68460eb") << OP_CHECKSIG;
+
+        txNew[4].vin.resize(1);
+        txNew[4].vout.resize(1);
+        txNew[4].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[4].vout[0].nValue = 32528.46125576 * COIN;
+        txNew[4].vout[0].scriptPubKey = CScript() << ParseHex("0457946931a8ea01f120d9df57230c3cf5cf18b8ff68572cf6914b6420e48f79b88fd8d45fb7f7d197f0a090507101215a6d467d342d2d4f814adc5a54a7e79c35") << OP_CHECKSIG;
+
+        txNew[5].vin.resize(1);
+        txNew[5].vout.resize(1);
+        txNew[5].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[5].vout[0].nValue = 6586.22248238 * COIN;
+        txNew[5].vout[0].scriptPubKey = CScript() << ParseHex("0410de30c0489d922da0c1ca805565f139730cd9b69bded0f3378e9dfe7ac277bf48002e9f014d6084cf1074d2994033ad4c11dd0f7b9f8e5bfb4a723d82a1e675") << OP_CHECKSIG;
+
+        txNew[6].vin.resize(1);
+        txNew[6].vout.resize(1);
+        txNew[6].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[6].vout[0].nValue = 8628.23905988 * COIN;
+        txNew[6].vout[0].scriptPubKey = CScript() << ParseHex("04e542e7856f1427942f550acb028ef68a13e42d7380c1bb1554279cf68410aac6770bc6b2fe7db863c3718aea989ce5d53d586f7be5f086a58b897adc1198ef7f") << OP_CHECKSIG;
+
+        txNew[7].vin.resize(1);
+        txNew[7].vout.resize(1);
+        txNew[7].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[7].vout[0].nValue = 7190.19921657 * COIN;
+        txNew[7].vout[0].scriptPubKey = CScript() << ParseHex("04f2af866c7dacc894381ef0b2ef69eb2e391d9ab589143d5d494e630a4978629ab66540f92e327c35e21f0fd4bbd877fe5979a386e7946e4bd2839d6f5c9b8c34") << OP_CHECKSIG;
+
+        txNew[8].vin.resize(1);
+        txNew[8].vout.resize(1);
+        txNew[8].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[8].vout[0].nValue = 1438.03984331 * COIN;
+        txNew[8].vout[0].scriptPubKey = CScript() << ParseHex("047c227a9ca0ed31ab1f30821dc92e4712f47f791fb8118bae8d52b66d444bf4208cbbebdad1fce451297502f1c744376dd43165248ee7cf4aad316132306ac43c") << OP_CHECKSIG;
+
+        txNew[9].vin.resize(1);
+        txNew[9].vout.resize(1);
+        txNew[9].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[9].vout[0].nValue = 1668.12621824 * COIN;
+        txNew[9].vout[0].scriptPubKey = CScript() << ParseHex("0482e0f289223082f255fcb7aafb852dda1743f92922f30089f0d806d8d59da3cefd682e2639cac1dc0fc728d2115ccd70729ba9d9cb09ded19ebadcb5ac52c538") << OP_CHECKSIG;
+
+        txNew[10].vin.resize(1);
+        txNew[10].vout.resize(1);
+        txNew[10].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[10].vout[0].nValue = 10641.49484052 * COIN;
+        txNew[10].vout[0].scriptPubKey = CScript() << ParseHex("04488b734534668ca6155436bdf021f0c431b58c6b0cc7527ce62dd0bc8b8be320789e6368920350014459278bb3eb9c755ddd90ba9f02477adbf86d3029675aba") << OP_CHECKSIG;
+
+        txNew[11].vin.resize(1);
+        txNew[11].vout.resize(1);
+        txNew[11].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[11].vout[0].nValue = 5737.77897482 * COIN;
+        txNew[11].vout[0].scriptPubKey = CScript() << ParseHex("046947fe6f5535802dd8eec0c4a2b4ec18b1cf75c9b797dc543fdae9fc6f2205cf8e0608fbcb5238e98efdc94beec68fade5aede52a9f8c5de5bc7397a04564f3a") << OP_CHECKSIG;
+
+        txNew[12].vin.resize(1);
+        txNew[12].vout.resize(1);
+        txNew[12].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[12].vout[0].nValue = 25597.10921098 * COIN;
+        txNew[12].vout[0].scriptPubKey = CScript() << ParseHex("04bbf608ffdf698690cb44ee72d66fd82c50564767d29680d5ecf6985771b8d11a962f8fbeca2ca21a2aeabac98dbc53f33757e283de34dcba58b5caeb738ad5c5") << OP_CHECKSIG;
+
+        txNew[13].vin.resize(1);
+        txNew[13].vout.resize(1);
+        txNew[13].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[13].vout[0].nValue = 3480.05642082 * COIN;
+        txNew[13].vout[0].scriptPubKey = CScript() << ParseHex("0483e631640981c765e4e5a34d3138e000b43c17ff181427ba6f74a89597f4a8e2664623672e5e3ab8f9596c38c9f61e6d943efcad5bb3433a44657837db49de30") << OP_CHECKSIG;
+
+        txNew[14].vin.resize(1);
+        txNew[14].vout.resize(1);
+        txNew[14].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[14].vout[0].nValue = 5283.35838433 * COIN;
+        txNew[14].vout[0].scriptPubKey = CScript() << ParseHex("0404790163471e1121bcce870567f3331feb787603f3d26939a1aebc975052897cdad6fa4aa9850bb30beefcde7fb686a130bab870c8dbc1861d49112d5bf09859") << OP_CHECKSIG;
+
+        txNew[15].vin.resize(1);
+        txNew[15].vout.resize(1);
+        txNew[15].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[15].vout[0].nValue = 7190.19921657 * COIN;
+        txNew[15].vout[0].scriptPubKey = CScript() << ParseHex("044a043444f9127df71006e423034e0ad3a63ab1b77da28a80b47e273eefc5e8712f3a6c6ca7823e71155593ab76278815bbee3d73228c432d5eacdee6e0f41eba") << OP_CHECKSIG;
+
+        txNew[16].vin.resize(1);
+        txNew[16].vout.resize(1);
+        txNew[16].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[16].vout[0].nValue = 4711.24084766 * COIN;
+        txNew[16].vout[0].scriptPubKey = CScript() << ParseHex("04d290468d5931f2fea8f77535e7764991dfceffdddc2cb4f76f5970e2eb01d830c0a327a0dc4ad55273dbe8d00bd7fe24215b0fd4dce91637551038d1639477a1") << OP_CHECKSIG;
+
+        txNew[17].vin.resize(1);
+        txNew[17].vout.resize(1);
+        txNew[17].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[17].vout[0].nValue = 1438.03984331 * COIN;
+        txNew[17].vout[0].scriptPubKey = CScript() << ParseHex("045fdf3a1602be579761ca5c3f1e6104a18c684a1474f05eb96ce505d9acca83390eaf888f688249de9d6054b753182a4b9387560dc239352b618beea5da2d1148") << OP_CHECKSIG;
+
+        txNew[18].vin.resize(1);
+        txNew[18].vout.resize(1);
+        txNew[18].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[18].vout[0].nValue = 7889.08658042 * COIN;
+        txNew[18].vout[0].scriptPubKey = CScript() << ParseHex("049cb411a156f8480d82176c1a9a64940447b16220edd44502c4f79ff79a9019947183b73894b57bf6aba99f99aa16709914b7b2f9cb71f431aa5b463089581dda") << OP_CHECKSIG;
+
+        txNew[19].vin.resize(1);
+        txNew[19].vout.resize(1);
+        txNew[19].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[19].vout[0].nValue = 36952.1249088 * COIN;
+        txNew[19].vout[0].scriptPubKey = CScript() << ParseHex("0408653714ef7b925bc9253a315bdc50ee1d69cedc7d621b6d26ccd90a864a2e2d150c6167dfc8669b6c34dc93afad0489217d774f68520f89add9bb6b63b55e28") << OP_CHECKSIG;
+
+        txNew[20].vin.resize(1);
+        txNew[20].vout.resize(1);
+        txNew[20].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[20].vout[0].nValue = 43141.19529941 * COIN;
+        txNew[20].vout[0].scriptPubKey = CScript() << ParseHex("0454380b3e001d99867b26d6f87eaa0b9385183a08bbfcd94d2f9dea1ee3264168bc6d207a45016c99fc397611d76bfdb32bc84c477d47eb5bfaad3986ccacd803") << OP_CHECKSIG;
+
+        txNew[21].vin.resize(1);
+        txNew[21].vout.resize(1);
+        txNew[21].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[21].vout[0].nValue = 287607.96866274 * COIN;
+        txNew[21].vout[0].scriptPubKey = CScript() << ParseHex("0431af43fa783a8cb517eb2e176ce2374794388adc45fd08e7a2107ac8025b0e427e3b9b0f8bcc898fc5a73464d23f705a3181e0fdea5f745df059a4f68826703c") << OP_CHECKSIG;
+
+        txNew[22].vin.resize(1);
+        txNew[22].vout.resize(1);
+        txNew[22].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[22].vout[0].nValue = 603.97673419 * COIN;
+        txNew[22].vout[0].scriptPubKey = CScript() << ParseHex("04104e9c43c1082c1c0184f24cf23acc00577d4ba51b4b95ac76731d04a16e01c3de7e73babfe0e6fb5deea2a16cc06894b84759ff626c3dbc5a7ed4356e536f89") << OP_CHECKSIG;
+
+        txNew[23].vin.resize(1);
+        txNew[23].vout.resize(1);
+        txNew[23].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[23].vout[0].nValue = 57521.59373255 * COIN;
+        txNew[23].vout[0].scriptPubKey = CScript() << ParseHex("045d1c9d519e35930b659aab08f3f589e75704c59aecf30c10ca6f6b42a46e91085f0b99f58d533b9acfea7836bf1511a4c9a99776ec746972a01c945f967c39aa") << OP_CHECKSIG;
+
+        txNew[24].vin.resize(1);
+        txNew[24].vout.resize(1);
+        txNew[24].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[24].vout[0].nValue = 2876.07968663 * COIN;
+        txNew[24].vout[0].scriptPubKey = CScript() << ParseHex("04efbbb10e189123cf921aa7f7b1ab91deaf1ea8c2d3602ef9d9d13d778d8241dd38c31e6ed6e7f7720a644b71a80c6fafa9b8283c84e9c5878207c3bbc990e539") << OP_CHECKSIG;
+
+        txNew[25].vin.resize(1);
+        txNew[25].vout.resize(1);
+        txNew[25].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[25].vout[0].nValue = 2876.07968663 * COIN;
+        txNew[25].vout[0].scriptPubKey = CScript() << ParseHex("043a2e7c741b194fa988b11dea060b8e7e8bc1ca49a82338958a14f650a30b9a67c6d81a5233b55f0f59444815e22be1a0c05e998d05d8e8515bf5139b35000bd8") << OP_CHECKSIG;
+
+        txNew[26].vin.resize(1);
+        txNew[26].vout.resize(1);
+        txNew[26].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[26].vout[0].nValue = 86282.39059882 * COIN;
+        txNew[26].vout[0].scriptPubKey = CScript() << ParseHex("04ced134f2b48280bd0066d85257f02b36dcd820c9db8ce627f8d9e6b03d1ffb09ffe7c2b88b06657c88e4ebd742047c6f04051da8e15a0dea394284af8340579f") << OP_CHECKSIG;
+
+        txNew[27].vin.resize(1);
+        txNew[27].vout.resize(1);
+        txNew[27].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[27].vout[0].nValue = 2876.07968663 * COIN;
+        txNew[27].vout[0].scriptPubKey = CScript() << ParseHex("04b5475e5650e72e48da6d639e8dbda423782d1f3445bb06bfac69fbe7cc548ab986e98bbbb111cb0d42c647704462241e9152574ba3f04becebd32f27acf15082") << OP_CHECKSIG;
+
+        txNew[28].vin.resize(1);
+        txNew[28].vout.resize(1);
+        txNew[28].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[28].vout[0].nValue = 4050.06061414 * COIN;
+        txNew[28].vout[0].scriptPubKey = CScript() << ParseHex("04945018f2589025aece51e8f45fee0f1998076cbaaa3d715e77bd9abb378be8cb7b23dda28d71af993aa2262807ffdfd0bfcae3846366c34f8b86556927c5e58e") << OP_CHECKSIG;
+
+        txNew[29].vin.resize(1);
+        txNew[29].vout.resize(1);
+        txNew[29].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[29].vout[0].nValue = 1955.73418691 * COIN;
+        txNew[29].vout[0].scriptPubKey = CScript() << ParseHex("04d9c39d55aa779412490e7d6efbf1c3d5aa10e2fb6f9e2efe70da72c2e9285618f8f88680d83978593684b469d831f6373836fc10de94bae76bfc626dedf570e0") << OP_CHECKSIG;
+
+        txNew[30].vin.resize(1);
+        txNew[30].vout.resize(1);
+        txNew[30].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[30].vout[0].nValue = 5752.15937325 * COIN;
+        txNew[30].vout[0].scriptPubKey = CScript() << ParseHex("04e6c7d30fe35aae7094de2b2b3cfdea71a501d489315564315a36b6b5bddf6f6b665fd527c1c9acddbf1c944c432ff7434327eaa145fbaa5d8b41ceb620851086") << OP_CHECKSIG;
+
+        txNew[31].vin.resize(1);
+        txNew[31].vout.resize(1);
+        txNew[31].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[31].vout[0].nValue = 3451.29562395 * COIN;
+        txNew[31].vout[0].scriptPubKey = CScript() << ParseHex("044e4cfe1627ecb1e14d4b2c16f3fc0ae0c6b82e395a6fb23be98089863fd41688a1bd32792964f85915c65620233b59e057d560f96826e2b52a14635e8e1f8efc") << OP_CHECKSIG;
+
+        txNew[32].vin.resize(1);
+        txNew[32].vout.resize(1);
+        txNew[32].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[32].vout[0].nValue = 287636.7294596 * COIN;
+        txNew[32].vout[0].scriptPubKey = CScript() << ParseHex("042f84fb3a969acff39f5a1fd9487a828526d5082e3b03cb12c42c6c43be882e510ca6afe9ca17eeb97d9b1c7494ce06162ff80cd49abaa99940669d65b12dcc86") << OP_CHECKSIG;
+
+        txNew[33].vin.resize(1);
+        txNew[33].vout.resize(1);
+        txNew[33].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[33].vout[0].nValue = 14383.27451282 * COIN;
+        txNew[33].vout[0].scriptPubKey = CScript() << ParseHex("040d52d040141b7ba0a871e462843b78530ee7a21464df86bf1809aefa153d93fd7eebcfeb24ecbb30b713838ad305ff3ab077d011e531b249f21dff203b577504") << OP_CHECKSIG;
+
+        txNew[34].vin.resize(1);
+        txNew[34].vout.resize(1);
+        txNew[34].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[34].vout[0].nValue = 39692.77575514 * COIN;
+        txNew[34].vout[0].scriptPubKey = CScript() << ParseHex("04bbf608ffdf698690cb44ee72d66fd82c50564767d29680d5ecf6985771b8d11a962f8fbeca2ca21a2aeabac98dbc53f33757e283de34dcba58b5caeb738ad5c5") << OP_CHECKSIG;
+
+        txNew[35].vin.resize(1);
+        txNew[35].vout.resize(1);
+        txNew[35].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[35].vout[0].nValue = 28760.79686627 * COIN;
+        txNew[35].vout[0].scriptPubKey = CScript() << ParseHex("045747f00a53766afc9a22e36af6f25be8c5a4807ffd5fb4ba09c2dbf4f425ef76e44f776ff7c001366c1efc8000be42051618f631b6f4cf7be0923dcb5cd0ea77") << OP_CHECKSIG;
+
+        txNew[36].vin.resize(1);
+        txNew[36].vout.resize(1);
+        txNew[36].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[36].vout[0].nValue = 86282.39059882 * COIN;
+        txNew[36].vout[0].scriptPubKey = CScript() << ParseHex("045b1afd6815107f4d6f5da84f391621669661c92029695682f46298fb9cf49f28ed135f9a7eb2dfe56dbe375463c8f6da4afe36d8c79eeb6eb7a0465b1e9a5545") << OP_CHECKSIG;
+
+        txNew[37].vin.resize(1);
+        txNew[37].vout.resize(1);
+        txNew[37].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[37].vout[0].nValue = 57521.59373255 * COIN;
+        txNew[37].vout[0].scriptPubKey = CScript() << ParseHex("04de10de0ac1f1418586ef7deee1d7125cbdda7ce0404c410f0a6ab967e6c51684e3fae6c388ac8faf6f466a79c62a2435cb0dd94e7f2c41bc6a24fffd1220dfb6") << OP_CHECKSIG;
+
+        txNew[38].vin.resize(1);
+        txNew[38].vout.resize(1);
+        txNew[38].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[38].vout[0].nValue = 8394.72180949 * COIN;
+        txNew[38].vout[0].scriptPubKey = CScript() << ParseHex("048efac43c7e64009db3715f602762a393332502c8cd6c201ce7bcef07304e2280733935034ceb42ec0483aa4d290c220267d78e4e4d8c1361196dfa837a7a61b3") << OP_CHECKSIG;
+
+        txNew[39].vin.resize(1);
+        txNew[39].vout.resize(1);
+        txNew[39].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[39].vout[0].nValue = 1049.83437263 * COIN;
+        txNew[39].vout[0].scriptPubKey = CScript() << ParseHex("04e35be5288273e39084498bee3c021a642166a92018626a8250b7c21c9dcb98fc89faaec32829584e039105310c49af2d305f15e0e6e5b049a7a54d9512a9c7ef") << OP_CHECKSIG;
+
+        txNew[40].vin.resize(1);
+        txNew[40].vout.resize(1);
+        txNew[40].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[40].vout[0].nValue = 6316.93945544 * COIN;
+        txNew[40].vout[0].scriptPubKey = CScript() << ParseHex("04103327b2d7e2af499e3c09325d5e928487d21faca41199fa9c4449576fda047d4ce39654725caeec43611d53ae422061826e3dc688aced64abd61c7e947f6321") << OP_CHECKSIG;
+
+        txNew[41].vin.resize(1);
+        txNew[41].vout.resize(1);
+        txNew[41].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[41].vout[0].nValue = 20477.68736879 * COIN;
+        txNew[41].vout[0].scriptPubKey = CScript() << ParseHex("041a6fbdb57d7831640ebe5ee332ea5fc9db25d76882ed8f9cc128fb7a0426c99bd238d90356e27356ebd6c52068705e45822447a0543c6cb9e8f4d326dfd8d1f1") << OP_CHECKSIG;
+
+        txNew[42].vin.resize(1);
+        txNew[42].vout.resize(1);
+        txNew[42].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[42].vout[0].nValue = 4314.11952994 * COIN;
+        txNew[42].vout[0].scriptPubKey = CScript() << ParseHex("049d3edc696b971915ba8ed89dc3ca0d2277d7e846afc8bd7f3e903272b037eb5f6adbd6b4c5e8833cceb701de63280739467f5aa2928105260b9242416e4a95f4") << OP_CHECKSIG;
+
+        txNew[43].vin.resize(1);
+        txNew[43].vout.resize(1);
+        txNew[43].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[43].vout[0].nValue = 25884.71717965 * COIN;
+        txNew[43].vout[0].scriptPubKey = CScript() << ParseHex("04d11ba73b248a3aaf51ba787177592b88bc522bb1a2123371a14d94911855811b3569fca4dc17857163e18b19072e7af1471a8a8495fda23c8e04ebdb866836b0") << OP_CHECKSIG;
+
+        txNew[44].vin.resize(1);
+        txNew[44].vout.resize(1);
+        txNew[44].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[44].vout[0].nValue = 16221.08943258 * COIN;
+        txNew[44].vout[0].scriptPubKey = CScript() << ParseHex("04a44aa0f33ce22135dd255ee16c2928a0d19172bffba2ce31c0c84f051fda34ebd1d75ce0c610513b416a356c40abeac6b7b8e903b7d12519124f26000390ac61") << OP_CHECKSIG;
+
+        txNew[45].vin.resize(1);
+        txNew[45].vout.resize(1);
+        txNew[45].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[45].vout[0].nValue = 19916.63037176 * COIN;
+        txNew[45].vout[0].scriptPubKey = CScript() << ParseHex("04945018f2589025aece51e8f45fee0f1998076cbaaa3d715e77bd9abb378be8cb7b23dda28d71af993aa2262807ffdfd0bfcae3846366c34f8b86556927c5e58e") << OP_CHECKSIG;
+
+        txNew[46].vin.resize(1);
+        txNew[46].vout.resize(1);
+        txNew[46].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[46].vout[0].nValue = 4314.11952994 * COIN;
+        txNew[46].vout[0].scriptPubKey = CScript() << ParseHex("04f21275016fd7b4ad989693e8bd9516f4e517c22f1a6335ae5fd6d75f437bd1c1c2b91b2f03e3f63430ea4373cc9eab5fd9dc322e981233f830e550535005b6aa") << OP_CHECKSIG;
+
+        txNew[47].vin.resize(1);
+        txNew[47].vout.resize(1);
+        txNew[47].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[47].vout[0].nValue = 100662.78903196 * COIN;
+        txNew[47].vout[0].scriptPubKey = CScript() << ParseHex("0439871a7f0d445d2e3ee56e000ce051b23a5a0cc3459137547ede0441da0f884c3887ad0ff9dfc9416b1331d301511b4c25b6d86c33775a2148dbb5bde7f30263") << OP_CHECKSIG;
+
+        txNew[48].vin.resize(1);
+        txNew[48].vout.resize(1);
+        txNew[48].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[48].vout[0].nValue = 198664.9774311 * COIN;
+        txNew[48].vout[0].scriptPubKey = CScript() << ParseHex("048713ddf7763abeb8ffd35166082589789fe4a9b4148b9120c83f38bd247046d3e132d2252c0118e87e18f556e1a424b535f5fede4c4fde6fa66d48fe31e92144") << OP_CHECKSIG;
+
+        txNew[49].vin.resize(1);
+        txNew[49].vout.resize(1);
+        txNew[49].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[49].vout[0].nValue = 1869.45179631 * COIN;
+        txNew[49].vout[0].scriptPubKey = CScript() << ParseHex("045eed3ac90a6fc196419acb0826e1e43c89b9b7cf6b52c0792d7c19b5ffaa86572862ccb390e85586998d2fc3195749aaba55bc81926e1bbc8e5bc9d662ec29c9") << OP_CHECKSIG;
+
+        txNew[50].vin.resize(1);
+        txNew[50].vout.resize(1);
+        txNew[50].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[50].vout[0].nValue = 143803.98433137 * COIN;
+        txNew[50].vout[0].scriptPubKey = CScript() << ParseHex("04413cbf5327d7d0309098c8c6a38d7ed968ccdcd113fc663eb9a0639456dbb02f8fed0698337cf1f910e9c47a93b345f895f691433744de7187ea3dbe8d50d1a4") << OP_CHECKSIG;
+
+        txNew[51].vin.resize(1);
+        txNew[51].vout.resize(1);
+        txNew[51].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[51].vout[0].nValue = 2876.07968663 * COIN;
+        txNew[51].vout[0].scriptPubKey = CScript() << ParseHex("04e2b91e5bfde20c62cbcf623c282d5cd50562f527ad79fb9189f42d9eccb8ef459896a626721c20c2d67d498850c0ac30da40828da58eb089f0c8f2bad7aede34") << OP_CHECKSIG;
+
+        txNew[52].vin.resize(1);
+        txNew[52].vout.resize(1);
+        txNew[52].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[52].vout[0].nValue = 11504.31874651 * COIN;
+        txNew[52].vout[0].scriptPubKey = CScript() << ParseHex("041f2661b75bb2fce7daa092c267c082f52c5109a695e005fb73aec4d18dae9e4820b24c29eb646fc829974a0852cc85a6970fbd4fb625a5c4bfe223b3a77f9530") << OP_CHECKSIG;
+
+        txNew[53].vin.resize(1);
+        txNew[53].vout.resize(1);
+        txNew[53].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[53].vout[0].nValue = 5910.66961585 * COIN;
+        txNew[53].vout[0].scriptPubKey = CScript() << ParseHex("045e51f188c7a7378f2bbc9e4f584f439d001624deb6f928eed73f7815cc6acc6ea6afe8be81f6c386fdb16ea701b2f5c9d55c2d74963d06b4ba4ec4b657b75fd1") << OP_CHECKSIG;
+
+        txNew[54].vin.resize(1);
+        txNew[54].vout.resize(1);
+        txNew[54].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[54].vout[0].nValue = 28760.79686627 * COIN;
+        txNew[54].vout[0].scriptPubKey = CScript() << ParseHex("042cc53999404da414b7b32d6015d73b97d7d2dfa0b17a2c39fc8ad62ab988bdafcbc77c7688e192e2b56ddab44e5c33ebfeb24ecdf99338c293014255b2e43c7e") << OP_CHECKSIG;
+
+        txNew[55].vin.resize(1);
+        txNew[55].vout.resize(1);
+        txNew[55].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[55].vout[0].nValue = 7190.19921657 * COIN;
+        txNew[55].vout[0].scriptPubKey = CScript() << ParseHex("040cb424d5ab0cddf891d6026517418e0bd8298a7bf1fa7c253ee4d7779420b6f6f03102feea12e6045d53f3f1e3b83128826584997a995abd449fa2e9c4ef32bb") << OP_CHECKSIG;
+
+        txNew[56].vin.resize(1);
+        txNew[56].vout.resize(1);
+        txNew[56].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[56].vout[0].nValue = 14322.8768394 * COIN;
+        txNew[56].vout[0].scriptPubKey = CScript() << ParseHex("046460f3b13cd5b011150ea59693148a6ad7ea4349232b746653e51f4f9fd16be3d96e879994d48d3ae078cc7aaddd3fb00c1e921810496e18363109414079a3ca") << OP_CHECKSIG;
+
+        txNew[57].vin.resize(1);
+        txNew[57].vout.resize(1);
+        txNew[57].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[57].vout[0].nValue = 5752.15937325 * COIN;
+        txNew[57].vout[0].scriptPubKey = CScript() << ParseHex("04936566a5b373fff0d774eff30024d200141dabb279bd182473eef44171868e99c82dbeeeb5414cba3d263539eb649b64b8a816a68213d2d500c7def37301dde1") << OP_CHECKSIG;
+
+        txNew[58].vin.resize(1);
+        txNew[58].vout.resize(1);
+        txNew[58].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[58].vout[0].nValue = 5752.15937325 * COIN;
+        txNew[58].vout[0].scriptPubKey = CScript() << ParseHex("0408a757d29e30a49240d091686854270e38717c2a4d357df0953f38c79ca57b080f805a51bb399942716d1e757fb8ee1a474f75de0b3338012d1b26af305f7461") << OP_CHECKSIG;
+
+        txNew[59].vin.resize(1);
+        txNew[59].vout.resize(1);
+        txNew[59].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[59].vout[0].nValue = 5752.15937325 * COIN;
+        txNew[59].vout[0].scriptPubKey = CScript() << ParseHex("04745322c8cd37a946794bb6644beb3226dd4c56ba9f17fd3af0902baa662a5dc61a2fec3c1a37d197f2567d1a0b1c82e3bdc5df499108e9b651c153766ae8fb80") << OP_CHECKSIG;
+
+        txNew[60].vin.resize(1);
+        txNew[60].vout.resize(1);
+        txNew[60].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[60].vout[0].nValue = 4116.28321175 * COIN;
+        txNew[60].vout[0].scriptPubKey = CScript() << ParseHex("04327591c6f9a41571128cb83c88ed671c32988f784585638e9fc5cd7ddd803af1bfb1ec10af62f7c20dc226903db12d27204224a77038302c68efe48f5837f69c") << OP_CHECKSIG;
+
+        txNew[61].vin.resize(1);
+        txNew[61].vout.resize(1);
+        txNew[61].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[61].vout[0].nValue = 74778.07185231 * COIN;
+        txNew[61].vout[0].scriptPubKey = CScript() << ParseHex("040615d64e8991da9fc16a64464cc1febccb4822ee0e794553896427f74a92bd9a30899c3e17fdf09632b04f1feb77a833cd36cd0f9a53f94f1845e6a083cbf664") << OP_CHECKSIG;
+
+        txNew[62].vin.resize(1);
+        txNew[62].vout.resize(1);
+        txNew[62].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[62].vout[0].nValue = 28760.79686627 * COIN;
+        txNew[62].vout[0].scriptPubKey = CScript() << ParseHex("0487a81bff971561b333b5fbacb7bea217dc5d7428118f8604b1ea9d659c14d57825c44d58fb8bc110bf58c55c348da1de233fe8853c85740ed3e2160bc70649cb") << OP_CHECKSIG;
+
+        txNew[63].vin.resize(1);
+        txNew[63].vout.resize(1);
+        txNew[63].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[63].vout[0].nValue = 4739.81958868 * COIN;
+        txNew[63].vout[0].scriptPubKey = CScript() << ParseHex("0471b9dd895f41cf7b82eff237dd29ca258369f67844d9824e9ea0f5919a3d65525c9aededea170bba18fed97b45d05a359fd5a9f9d0087ddd71de753fec8ad99c") << OP_CHECKSIG;
+
+        txNew[64].vin.resize(1);
+        txNew[64].vout.resize(1);
+        txNew[64].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[64].vout[0].nValue = 2876.07968663 * COIN;
+        txNew[64].vout[0].scriptPubKey = CScript() << ParseHex("04a6bbe31021e1a36805cfb0a845dee85f058c4af6ab17499f548a4ae30281f2f23ab39419db0e0b9d3a5144d7b52d52c46336a224c35633650c75e5f0098492e5") << OP_CHECKSIG;
+
+        txNew[65].vin.resize(1);
+        txNew[65].vout.resize(1);
+        txNew[65].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[65].vout[0].nValue = 2876.07968663 * COIN;
+        txNew[65].vout[0].scriptPubKey = CScript() << ParseHex("04ba75968101a7bf95a7a43b5587860e9a1f5e3e21c799ff4672d6a417b72e3dd30725054c705b363b9d0b254d6226141f02d80631a43c41b62480ebe7b3eb659f") << OP_CHECKSIG;
+
+        txNew[66].vin.resize(1);
+        txNew[66].vout.resize(1);
+        txNew[66].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[66].vout[0].nValue = 2588.47171796 * COIN;
+        txNew[66].vout[0].scriptPubKey = CScript() << ParseHex("04b3bfaf86aab8c5db2c945af098bbcf434a6597feb052e7379ed13e1e849809ea86ba3c63f27342a33165da8695b850302a553f4da56575be62d4081c5a009127") << OP_CHECKSIG;
+
+        txNew[67].vin.resize(1);
+        txNew[67].vout.resize(1);
+        txNew[67].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[67].vout[0].nValue = 3163.68765529 * COIN;
+        txNew[67].vout[0].scriptPubKey = CScript() << ParseHex("04b3bfaf86aab8c5db2c945af098bbcf434a6597feb052e7379ed13e1e849809ea86ba3c63f27342a33165da8695b850302a553f4da56575be62d4081c5a009127") << OP_CHECKSIG;
+
+        txNew[68].vin.resize(1);
+        txNew[68].vout.resize(1);
+        txNew[68].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[68].vout[0].nValue = 10093.52544411 * COIN;
+        txNew[68].vout[0].scriptPubKey = CScript() << ParseHex("04d290468d5931f2fea8f77535e7764991dfceffdddc2cb4f76f5970e2eb01d830c0a327a0dc4ad55273dbe8d00bd7fe24215b0fd4dce91637551038d1639477a1") << OP_CHECKSIG;
+
+        txNew[69].vin.resize(1);
+        txNew[69].vout.resize(1);
+        txNew[69].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[69].vout[0].nValue = 52051.86538452 * COIN;
+        txNew[69].vout[0].scriptPubKey = CScript() << ParseHex("044aabea4802df8bd2a670fb79842af3100d727a69eaed1c0fce70cc2c9488014152e62fe3674bc6c95f441ff5552bb0647db77c2403997a48838bf115e528468b") << OP_CHECKSIG;
+
+        txNew[70].vin.resize(1);
+        txNew[70].vout.resize(1);
+        txNew[70].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[70].vout[0].nValue = 44809.32151765 * COIN;
+        txNew[70].vout[0].scriptPubKey = CScript() << ParseHex("0490c0271e4387a3804d81b210278a82f7705d0ec8c320840c2b2bb05a55ae17abcfe7575b0b9e79838b48ecd44b015033b2d228b6e2fc1e5ac5a73736901b5d49") << OP_CHECKSIG;
+
+        txNew[71].vin.resize(1);
+        txNew[71].vout.resize(1);
+        txNew[71].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[71].vout[0].nValue = 19033.8953661 * COIN;
+        txNew[71].vout[0].scriptPubKey = CScript() << ParseHex("041689b41c103cce3ccb8e551c1de2d506e57d423818103783afcff48aad8868f24cd3bf6f81e8fce544932ad6bec1713c13ad64fd6aadc50fd86e85c3dc4f7bcc") << OP_CHECKSIG;
+
+        txNew[72].vin.resize(1);
+        txNew[72].vout.resize(1);
+        txNew[72].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[72].vout[0].nValue = 5752.15937325 * COIN;
+        txNew[72].vout[0].scriptPubKey = CScript() << ParseHex("0406afbe6de717d6611639305b89ad1693928026626169cfc44a181832c0089dc876969c11e5b830369d182c1f7a4373acb2a0571556a23fcc76b45717559abb81") << OP_CHECKSIG;
+
+        txNew[73].vin.resize(1);
+        txNew[73].vout.resize(1);
+        txNew[73].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[73].vout[0].nValue = 301.9883671 * COIN;
+        txNew[73].vout[0].scriptPubKey = CScript() << ParseHex("043c0c1e7d9c80b78d379be0b4a23b952444648887dc49cd50088a4884ba65eed669043bd229b2a7f7b0cf9c1f4dc00ae93c8bad2b29d40de06a078545ac13b7a8") << OP_CHECKSIG;
+
+        txNew[74].vin.resize(1);
+        txNew[74].vout.resize(1);
+        txNew[74].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[74].vout[0].nValue = 7046.39523224 * COIN;
+        txNew[74].vout[0].scriptPubKey = CScript() << ParseHex("048f9d62fc83a990ca141bfa63d4771420a33f9b75af197cde980173ae395ecb5147297a9d4b59d6d3c705468e45beef70d43a4d8e302a9343ed69c7506f6ec549") << OP_CHECKSIG;
+
+        txNew[75].vin.resize(1);
+        txNew[75].vout.resize(1);
+        txNew[75].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[75].vout[0].nValue = 115043.18746509 * COIN;
+        txNew[75].vout[0].scriptPubKey = CScript() << ParseHex("04576a329b40aea0bd0cf116d9bff88bc5ba475bb36e5918b30f532e029faaceeefdbae0f876e7ce97d70dcafeea482dad9b1fb299af4cd9faf8222aaa32e11327") << OP_CHECKSIG;
+
+        txNew[76].vin.resize(1);
+        txNew[76].vout.resize(1);
+        txNew[76].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[76].vout[0].nValue = 14380.39843314 * COIN;
+        txNew[76].vout[0].scriptPubKey = CScript() << ParseHex("04f861181f808e2da904fc44e04076926da43dd17d866c8e1aeb48511f19bb71ef5d151b487486cb291a339a3b9c418678727f460c23e141b31d31dc6f365ba425") << OP_CHECKSIG;
+
+        txNew[77].vin.resize(1);
+        txNew[77].vout.resize(1);
+        txNew[77].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[77].vout[0].nValue = 1758.25680346 * COIN;
+        txNew[77].vout[0].scriptPubKey = CScript() << ParseHex("048df96594e1e6197ba347c0ed32141bc6846c8268baed22cc1c5bc2c4986fe8a75ebef159a9b008b55c1a10c07a9606b9ef1e11d753dff94d26f5dbe187c8b6aa") << OP_CHECKSIG;
+
+        txNew[78].vin.resize(1);
+        txNew[78].vout.resize(1);
+        txNew[78].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[78].vout[0].nValue = 86282.39059882 * COIN;
+        txNew[78].vout[0].scriptPubKey = CScript() << ParseHex("04c122bd2baf87b99f5e67b62405e585dc3f9a438f092839d4ed6a3f02ff8006132f3b949714918684d014c1fbd0cacaeb972883dff6dec2ea8ed58add5628561c") << OP_CHECKSIG;
+
+        txNew[79].vin.resize(1);
+        txNew[79].vout.resize(1);
+        txNew[79].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[79].vout[0].nValue = 3106.79966191 * COIN;
+        txNew[79].vout[0].scriptPubKey = CScript() << ParseHex("04b89a781361013d40672312f6064250ee52d2fa1baadb94272816d482957bc7454b2bd0afc8a734bdb6c8f4d5104ec976db3694d0a3c632a8c8c75a45eb6962c3") << OP_CHECKSIG;
+
+        txNew[80].vin.resize(1);
+        txNew[80].vout.resize(1);
+        txNew[80].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[80].vout[0].nValue = 14380.39843314 * COIN;
+        txNew[80].vout[0].scriptPubKey = CScript() << ParseHex("04eab7aa9d256d707f9572b5293cc7934f68f7ea356f2e255673cc2f1cef7ad65bc2bf42d41f6f5e47e8716f24bfac061da7977f2cc6cd1950ddf226dc6df8ef6b") << OP_CHECKSIG;
+
+        txNew[81].vin.resize(1);
+        txNew[81].vout.resize(1);
+        txNew[81].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[81].vout[0].nValue = 14380.39843314 * COIN;
+        txNew[81].vout[0].scriptPubKey = CScript() << ParseHex("044d1b19c71c517fbc2ccb6d00a9034b688bccec3a92d6ae05f234fff29730b95677b5dac415f9c8d855b0d361db374af240b8a47c1fbc7c54af5d263d68358d33") << OP_CHECKSIG;
+
+        txNew[82].vin.resize(1);
+        txNew[82].vout.resize(1);
+        txNew[82].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[82].vout[0].nValue = 2876.07968663 * COIN;
+        txNew[82].vout[0].scriptPubKey = CScript() << ParseHex("04e25410ea422ea7e9e645dec40962ac0a39ab6b2e7d2ee4f7fbebcb7dbad7c1f349d0e621f8ec7a9f51fbd613698b0aa483225e051ff6ec55a556e479f3094458") << OP_CHECKSIG;
+
+        txNew[83].vin.resize(1);
+        txNew[83].vout.resize(1);
+        txNew[83].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[83].vout[0].nValue = 5752.15937325 * COIN;
+        txNew[83].vout[0].scriptPubKey = CScript() << ParseHex("04e2b8a841d6518e63aa5f489eec405f506e8742067101948f4fe3c21a27c7f439aba1408be3cfddcac27962c8be28222bbe03dde0c61b5bd8d3ca9788273ff4be") << OP_CHECKSIG;
+
+        txNew[84].vin.resize(1);
+        txNew[84].vout.resize(1);
+        txNew[84].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[84].vout[0].nValue = 28760.79686627 * COIN;
+        txNew[84].vout[0].scriptPubKey = CScript() << ParseHex("04afeaeb4e1acc9ad8b11296a08b88effe83f6040a69c6ca68cc0fc8e9ff7aca6879ed786483e7495e2245464b58cbf9b3d074f5f1a662a19a3f272fe5ac627635") << OP_CHECKSIG;
+
+        txNew[85].vin.resize(1);
+        txNew[85].vout.resize(1);
+        txNew[85].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[85].vout[0].nValue = 14380.39843314 * COIN;
+        txNew[85].vout[0].scriptPubKey = CScript() << ParseHex("04bde2a1750003f00309889f8f63460fc531e68e4a92d8d8f31e80879f3bab855150425fd457adeff09b79369cf0fd452e62a835c60b06bf5d43d887a23d35a1f3") << OP_CHECKSIG;
+
+        txNew[86].vin.resize(1);
+        txNew[86].vout.resize(1);
+        txNew[86].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[86].vout[0].nValue = 4314.11952994 * COIN;
+        txNew[86].vout[0].scriptPubKey = CScript() << ParseHex("04e99252843b403225430bff8b24a92222cb20158d43b48bc278e538616e9b6f4482e2e8fa41192c211b3a625bb017948956711213a669c3e51bbbf85d44965233") << OP_CHECKSIG;
+
+        txNew[87].vin.resize(1);
+        txNew[87].vout.resize(1);
+        txNew[87].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[87].vout[0].nValue = 3399.52618959 * COIN;
+        txNew[87].vout[0].scriptPubKey = CScript() << ParseHex("044aefabdfca43c84211ac73317bf455cb8caae588abd2aaf0ad4d8b3fe44ad5133f902b39b82c676d602f3574e7841817be82eba7c624da717a42292621ff6baa") << OP_CHECKSIG;
+
+        txNew[88].vin.resize(1);
+        txNew[88].vout.resize(1);
+        txNew[88].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[88].vout[0].nValue = 33218.72038055 * COIN;
+        txNew[88].vout[0].scriptPubKey = CScript() << ParseHex("04a89ec1621c670908051dbd84c17ed1c7a087a1239ad07fdf611493084b20548bde0d6fd0e6bd7a4d099797147b89536c21c23c4c27c155e8e9c4455f4c406070") << OP_CHECKSIG;
+
+        txNew[89].vin.resize(1);
+        txNew[89].vout.resize(1);
+        txNew[89].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[89].vout[0].nValue = 2876.07968663 * COIN;
+        txNew[89].vout[0].scriptPubKey = CScript() << ParseHex("04b7a0042c6a88ac29a9a226689ea41ff038bbe43ee2abcad4bcd753b2cb81591fc9e0dee897de1c21e717400fa6cadc01324ff1d114d1f0c647f62ea83687d6b0") << OP_CHECKSIG;
+
+        txNew[90].vin.resize(1);
+        txNew[90].vout.resize(1);
+        txNew[90].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[90].vout[0].nValue = 359.50996083 * COIN;
+        txNew[90].vout[0].scriptPubKey = CScript() << ParseHex("04bc0c8d0cbece047c9ed27c718a0b1cdcebb8f590bcf768bd8ad106615921a33e8d4f1491a61e5f5d20b5c4cec90d8b8cd91b74d5ba1a0e6b53aa9e77252b0eeb") << OP_CHECKSIG;
+
+        txNew[91].vin.resize(1);
+        txNew[91].vout.resize(1);
+        txNew[91].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[91].vout[0].nValue = 5749.28329357 * COIN;
+        txNew[91].vout[0].scriptPubKey = CScript() << ParseHex("047dd4e2553f40bf7d0c7570db1ca7213a20571011c5638222e9175e33af4f5bd14e10149d7374cb7871a2bf014b64e1d1647c16fa48114b9ee7293aa0aee6030e") << OP_CHECKSIG;
+
+        txNew[92].vin.resize(1);
+        txNew[92].vout.resize(1);
+        txNew[92].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[92].vout[0].nValue = 28760.79686627 * COIN;
+        txNew[92].vout[0].scriptPubKey = CScript() << ParseHex("049b6c931fb060bd4023d2f96e1fe954131d4cc6223ee81cb79de9ea861cd796bb618ce3f6ae683887cd18cdea18bb90d1685a031d8fe7447034ac4129f241efed") << OP_CHECKSIG;
+
+        txNew[93].vin.resize(1);
+        txNew[93].vout.resize(1);
+        txNew[93].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[93].vout[0].nValue = 4314.11952994 * COIN;
+        txNew[93].vout[0].scriptPubKey = CScript() << ParseHex("04fdbe7ae486f4fd3710f6416bd7bcdbee50dc04970311292f5f9b7f1004b8c2cee329cee722aef0baa0ee3107b33c92483fe96c215c630954a6a371eadf22e3de") << OP_CHECKSIG;
+
+        txNew[94].vin.resize(1);
+        txNew[94].vout.resize(1);
+        txNew[94].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[94].vout[0].nValue = 7768.29123358 * COIN;
+        txNew[94].vout[0].scriptPubKey = CScript() << ParseHex("0400cec8e13e464403b5026c2f2ed22e9c8adeed87533342be381c34a7a0833d6fad10a54dab5a9e159d851aa0e0c1ded23449a95f0cdb383262418f68440c1142") << OP_CHECKSIG;
+
+        txNew[95].vin.resize(1);
+        txNew[95].vout.resize(1);
+        txNew[95].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[95].vout[0].nValue = 250229.14684598 * COIN;
+        txNew[95].vout[0].scriptPubKey = CScript() << ParseHex("0466ee0fb3d34d2b106012319d525612260a1ceebed716e87e2b3c7c5190d2ecb9cdcfb71270b4455e99a3d4ec6a29ba15f596261efeb02d5976ec4bb04e763d64") << OP_CHECKSIG;
+
+        txNew[96].vin.resize(1);
+        txNew[96].vout.resize(1);
+        txNew[96].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[96].vout[0].nValue = 14380.39843314 * COIN;
+        txNew[96].vout[0].scriptPubKey = CScript() << ParseHex("048a435c1e48285b9e8a407983cc1a632ea51751e885e9c6abb1c55b59955c3b7fd43a169a9dbc6d30128820983a0b64179d1b9e98b64bf81c9a8e005e7b64cbde") << OP_CHECKSIG;
+
+        txNew[97].vin.resize(1);
+        txNew[97].vout.resize(1);
+        txNew[97].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[97].vout[0].nValue = 1725.64781198 * COIN;
+        txNew[97].vout[0].scriptPubKey = CScript() << ParseHex("049623f8b2d1d4cb7eeea8f4e9ce78cc6a7057dff96eaba7585a1a2be4057b17de3b5bffac29eda3b29df85efb7a597ddc2e331f9d38a3638c857352e3712412f8") << OP_CHECKSIG;
+
+        txNew[98].vin.resize(1);
+        txNew[98].vout.resize(1);
+        txNew[98].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[98].vout[0].nValue = 115043.18746509 * COIN;
+        txNew[98].vout[0].scriptPubKey = CScript() << ParseHex("04af381a9194cdc80393e3faaadf0c876e2fbdd9e01af85f18c5f3803642cde97a218af80489f98aff0ce5d069a79200b30b46992319f740922351543d636b7e58") << OP_CHECKSIG;
+
+        txNew[99].vin.resize(1);
+        txNew[99].vout.resize(1);
+        txNew[99].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[99].vout[0].nValue = 23636.35338894 * COIN;
+        txNew[99].vout[0].scriptPubKey = CScript() << ParseHex("04abc4916b3aaf2ef91512d44f95ee4f82c36769865ae396d4e55a7888dfd955b2ad0bc65aacee5dff3848ba803a227dc9915978a3caa3f9bee933f6a654bc3e0a") << OP_CHECKSIG;
+
+        txNew[100].vin.resize(1);
+        txNew[100].vout.resize(1);
+        txNew[100].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[100].vout[0].nValue = 2300.8637493 * COIN;
+        txNew[100].vout[0].scriptPubKey = CScript() << ParseHex("04014f524ac398f01e8124a697141a8466e67cef06246718844a6ed7d36e826483c6d58a1f33c4785a9641c55818c7818b1b95cbb2c8ee6d6c1b8f4d8d5fcf89f2") << OP_CHECKSIG;
+
+        txNew[101].vin.resize(1);
+        txNew[101].vout.resize(1);
+        txNew[101].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[101].vout[0].nValue = 4314.11952994 * COIN;
+        txNew[101].vout[0].scriptPubKey = CScript() << ParseHex("047bc402f700e8b1ced157288c2de0c6e93043cd1da6b530cbca100d20412e8fbf92c3359ec398ae1041f7c5dbfe0db8e8dfdd869f36144c29af81a658bf671934") << OP_CHECKSIG;
+
+        txNew[102].vin.resize(1);
+        txNew[102].vout.resize(1);
+        txNew[102].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[102].vout[0].nValue = 55508.33795191 * COIN;
+        txNew[102].vout[0].scriptPubKey = CScript() << ParseHex("04b5e9919977240dda52639ddb0d4d7d5ee94868f41847853af1b55f9927d32c286cc28a9832f9b62ec21563c4449de090385045a8ee726e5378ac35e9fbbb7b7f") << OP_CHECKSIG;
+
+        txNew[103].vin.resize(1);
+        txNew[103].vout.resize(1);
+        txNew[103].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[103].vout[0].nValue = 28760.79686627 * COIN;
+        txNew[103].vout[0].scriptPubKey = CScript() << ParseHex("04bbf608ffdf698690cb44ee72d66fd82c50564767d29680d5ecf6985771b8d11a962f8fbeca2ca21a2aeabac98dbc53f33757e283de34dcba58b5caeb738ad5c5") << OP_CHECKSIG;
+
+        txNew[104].vin.resize(1);
+        txNew[104].vout.resize(1);
+        txNew[104].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[104].vout[0].nValue = 10257.84996939 * COIN;
+        txNew[104].vout[0].scriptPubKey = CScript() << ParseHex("04d108fef1b0288571039a0229b1f7656e6f36f5f740dbad24e53c39e913b1985840609bc3003ac8d37e27a04abb5d47d8a3338ae817e916118d9b038cd79fd1df") << OP_CHECKSIG;
+
+        txNew[105].vin.resize(1);
+        txNew[105].vout.resize(1);
+        txNew[105].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[105].vout[0].nValue = 75094.24677007 * COIN;
+        txNew[105].vout[0].scriptPubKey = CScript() << ParseHex("042f6f9fdac0d845d3378d9a28d0a7e0200586484e54773e529391275da3f639f468a131ff215798b31ec1a93be917ca299de40bac970490089bf000a3a792c4a2") << OP_CHECKSIG;
+
+        txNew[106].vin.resize(1);
+        txNew[106].vout.resize(1);
+        txNew[106].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[106].vout[0].nValue = 14377.52235345 * COIN;
+        txNew[106].vout[0].scriptPubKey = CScript() << ParseHex("0401cad95aee4bc86074ce1d6592dd1a401130ca415950091a37eebb5092b3660a39fbff9f97bf8e934852ce1093be851ace60279c65844f9367eeaa4e785727a5") << OP_CHECKSIG;
+
+        txNew[107].vin.resize(1);
+        txNew[107].vout.resize(1);
+        txNew[107].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[107].vout[0].nValue = 43138.31921972 * COIN;
+        txNew[107].vout[0].scriptPubKey = CScript() << ParseHex("04bbf608ffdf698690cb44ee72d66fd82c50564767d29680d5ecf6985771b8d11a962f8fbeca2ca21a2aeabac98dbc53f33757e283de34dcba58b5caeb738ad5c5") << OP_CHECKSIG;
+
+        txNew[108].vin.resize(1);
+        txNew[108].vout.resize(1);
+        txNew[108].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[108].vout[0].nValue = 575.21593733 * COIN;
+        txNew[108].vout[0].scriptPubKey = CScript() << ParseHex("041b31aabb31ff5edbf221bb73a2741cf0a13f6894dba0c0516728ee440d8c1b66ca48d21fa59403e259acccd7de9247fb2bf141c10daa6cb960a8a5648461ab6a") << OP_CHECKSIG;
+
+        txNew[109].vin.resize(1);
+        txNew[109].vout.resize(1);
+        txNew[109].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[109].vout[0].nValue = 568.31334608 * COIN;
+        txNew[109].vout[0].scriptPubKey = CScript() << ParseHex("04be7bc4d9d329da22df9144c80973637674a331b9126bab2853ef950e8886d68727e35288797394e68201e79f564652807f50efcf7adb4cda5e7576bb246d2eed") << OP_CHECKSIG;
+
+        txNew[110].vin.resize(1);
+        txNew[110].vout.resize(1);
+        txNew[110].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[110].vout[0].nValue = 5752.15937325 * COIN;
+        txNew[110].vout[0].scriptPubKey = CScript() << ParseHex("04d77f7c2caac8392cf661f41e2e1332ef8765d2bc50d37f54f08cf3715d5a5fc5f5baf4573e040ce91e821e65e009beaee5984b1b92b9f8b960aa4951a76a73c4") << OP_CHECKSIG;
+
+        txNew[111].vin.resize(1);
+        txNew[111].vout.resize(1);
+        txNew[111].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[111].vout[0].nValue = 287.60796866 * COIN;
+        txNew[111].vout[0].scriptPubKey = CScript() << ParseHex("04f0eebc714807ff448d187f3b4a902fd33b382a98b1b4ad2737dab139a1644e8c167f32bb56f6163bcec0512d7d8e177931332d351b0c926f38e0fa3e04a6a06c") << OP_CHECKSIG;
+
+        txNew[112].vin.resize(1);
+        txNew[112].vout.resize(1);
+        txNew[112].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[112].vout[0].nValue = 2588.47171796 * COIN;
+        txNew[112].vout[0].scriptPubKey = CScript() << ParseHex("04f7e7d5ea360867464fc82edc6d2918a7966239742bb6a353a62c4b0e0446ac19c585aea558540673e4a72718e34eb8b7a85b330012d9ea364eef583a2f8c4d55") << OP_CHECKSIG;
+
+        txNew[113].vin.resize(1);
+        txNew[113].vout.resize(1);
+        txNew[113].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[113].vout[0].nValue = 287.60796866 * COIN;
+        txNew[113].vout[0].scriptPubKey = CScript() << ParseHex("044b062ff545eb9d0b474c5c690742a7f4aaef6383496b7229ee698a93582818c09ad9b74170e2cd0d140da5767a177adf026019a0b763424a373d25a8e35be75e") << OP_CHECKSIG;
+
+        txNew[114].vin.resize(1);
+        txNew[114].vout.resize(1);
+        txNew[114].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[114].vout[0].nValue = 14380.39843314 * COIN;
+        txNew[114].vout[0].scriptPubKey = CScript() << ParseHex("04041f5b116351b98b1d16002975f553e1734774a928d12b9f11ce4a1a81597467595b7021e2ec53a1428d08a176146fd73734f1ab9e5b7a422a3c8e0fb29abfe3") << OP_CHECKSIG;
+
+        txNew[115].vin.resize(1);
+        txNew[115].vout.resize(1);
+        txNew[115].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[115].vout[0].nValue = 1150.43187465 * COIN;
+        txNew[115].vout[0].scriptPubKey = CScript() << ParseHex("04b77e057b7bb7f905aa8501af55170645e4c96f26d1ca386d58a60d8b42b1db31237250e9b7ba5ad3f191838aaf5aa21dd1aae0fd83813091d1d7867c7debc6f4") << OP_CHECKSIG;
+
+        txNew[116].vin.resize(1);
+        txNew[116].vout.resize(1);
+        txNew[116].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[116].vout[0].nValue = 28760.79686627 * COIN;
+        txNew[116].vout[0].scriptPubKey = CScript() << ParseHex("040fe9445f845efcc1d82b85ea633b2962012f7bd13c3cafedcf7c605222e9f1e7b5837900d21f69f82fcf928420fc5cd933bac480bab2d1258f78e634225df93f") << OP_CHECKSIG;
+
+        txNew[117].vin.resize(1);
+        txNew[117].vout.resize(1);
+        txNew[117].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[117].vout[0].nValue = 2876.07968663 * COIN;
+        txNew[117].vout[0].scriptPubKey = CScript() << ParseHex("04dfec09f1bec174a646e8782e52eb2a044f881023013ea4f25ad1f7c186a1a4c316be432488cff230e565fcd3747173d62f680b29299a3c3bf62540a87e8fd785") << OP_CHECKSIG;
+
+        txNew[118].vin.resize(1);
+        txNew[118].vout.resize(1);
+        txNew[118].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[118].vout[0].nValue = 143803.98433137 * COIN;
+        txNew[118].vout[0].scriptPubKey = CScript() << ParseHex("0414cc5cbbd72cb37ff7a1d41b81fdd0e9414d143210c5d7e2c5940280f358e87d55277775c5aeba39b0670a7d148f2d4bc0448c13133a000c54753a56da52332d") << OP_CHECKSIG;
+
+        txNew[119].vin.resize(1);
+        txNew[119].vout.resize(1);
+        txNew[119].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[119].vout[0].nValue = 115043.18746509 * COIN;
+        txNew[119].vout[0].scriptPubKey = CScript() << ParseHex("04a5fab59775fc46b215e3154406b90c42486a4795b4b78d1f8fd3e6c1af9c3e01c83edc39f8cd0c2abbd1cb6b9bf0eba2be08498ea53031db995862177d1762be") << OP_CHECKSIG;
+
+        txNew[120].vin.resize(1);
+        txNew[120].vout.resize(1);
+        txNew[120].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[120].vout[0].nValue = 16733.58238606 * COIN;
+        txNew[120].vout[0].scriptPubKey = CScript() << ParseHex("04756f7138af81a53299affc8ab48fb8a1ed910dd371bf782ae6d0c440d020890aac058c98fed175bb1c357a4cd27d18e5d62765e14fae55a8f31d2a0c2d647a8c") << OP_CHECKSIG;
+
+        txNew[121].vin.resize(1);
+        txNew[121].vout.resize(1);
+        txNew[121].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[121].vout[0].nValue = 6419.40986055 * COIN;
+        txNew[121].vout[0].scriptPubKey = CScript() << ParseHex("043e34540cb6e3002c6515d1178efbaa82909aa1a2cc989b8c09892b794ad0c244da9c2cc8d9954f10022e0e168f99a87a11db33fef002d68380fee3f4cb8210e5") << OP_CHECKSIG;
+
+        txNew[122].vin.resize(1);
+        txNew[122].vout.resize(1);
+        txNew[122].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[122].vout[0].nValue = 8896.73921793 * COIN;
+        txNew[122].vout[0].scriptPubKey = CScript() << ParseHex("049b6ce35f48f67521fc6dec29dc8ecb25506674a2fd53cb392494b1d76ddc38b11b2ae093531f7c0fd5bd67b217c84e2a9f781e0fa6b0bc121d5cbf634e6c9176") << OP_CHECKSIG;
+
+        txNew[123].vin.resize(1);
+        txNew[123].vout.resize(1);
+        txNew[123].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[123].vout[0].nValue = 28760.79686627 * COIN;
+        txNew[123].vout[0].scriptPubKey = CScript() << ParseHex("0498fe884e25f93f8c91b337f2500e2d4b882f4b2c2c66bb6ff502b0ed02794f1432b6572a069e7afbe1777cde1465d32f35a6ec5747bc064f929688d4034d0e19") << OP_CHECKSIG;
+
+        txNew[124].vin.resize(1);
+        txNew[124].vout.resize(1);
+        txNew[124].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[124].vout[0].nValue = 28922.43254466 * COIN;
+        txNew[124].vout[0].scriptPubKey = CScript() << ParseHex("04ebfb8ba437ec725d5368ec65123a188dd1d8e7fea189044ae0f5496ce6f6a9f825c8440212472448e52e170928dd6093c3737c4c0d56d0b55a6460c31e6c45b7") << OP_CHECKSIG;
+
+        txNew[125].vin.resize(1);
+        txNew[125].vout.resize(1);
+        txNew[125].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[125].vout[0].nValue = 267475.41085634 * COIN;
+        txNew[125].vout[0].scriptPubKey = CScript() << ParseHex("04c96ddce0a8a87820f77802d7484c4b7e24a158a4357cbd87792ed224464442bb29e419cf2e5cc131d108eda43331ed523219697b535636e91ccda7173575e884") << OP_CHECKSIG;
+
+        txNew[126].vin.resize(1);
+        txNew[126].vout.resize(1);
+        txNew[126].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[126].vout[0].nValue = 24788.93081904 * COIN;
+        txNew[126].vout[0].scriptPubKey = CScript() << ParseHex("0405d4501caf1d252a342dff84afcb35e57883f0158fcb424e60b2b78026c4ff97fcb2c0e8cdc14b1696483b319943c6e70b51875420584efd9b9d747171d1958b") << OP_CHECKSIG;
+
+        txNew[127].vin.resize(1);
+        txNew[127].vout.resize(1);
+        txNew[127].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[127].vout[0].nValue = 2947.98167879 * COIN;
+        txNew[127].vout[0].scriptPubKey = CScript() << ParseHex("04477bd65703279a8437d2c211a516bd6dbc6e84292dcbaef055a13d0919a4a7e25821f763e5fd2c562bf28ad98ef1b1b923d99453d6d4bee6c6936f630266fe36") << OP_CHECKSIG;
+
+        txNew[128].vin.resize(1);
+        txNew[128].vout.resize(1);
+        txNew[128].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[128].vout[0].nValue = 2876.07968663 * COIN;
+        txNew[128].vout[0].scriptPubKey = CScript() << ParseHex("0400a91279ebf40af49f4f2867e65ce8a5364505c8c70ce1d5baafdcc0d90c55570b356599dbda367f3713cc25add7f846032823a453ec0ea22fcf32614035854f") << OP_CHECKSIG;
+
+        txNew[129].vin.resize(1);
+        txNew[129].vout.resize(1);
+        txNew[129].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[129].vout[0].nValue = 1150.43187465 * COIN;
+        txNew[129].vout[0].scriptPubKey = CScript() << ParseHex("048dbee5ef060ba4986ef279de47bdda6f49e1c54116ba533d99735bf803b2fed609e33c111d4f6120d7dac751d48cc58364256f4de34b94b3a5d97137a5adbc36") << OP_CHECKSIG;
+
+        txNew[130].vin.resize(1);
+        txNew[130].vout.resize(1);
+        txNew[130].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[130].vout[0].nValue = 1639.36542138 * COIN;
+        txNew[130].vout[0].scriptPubKey = CScript() << ParseHex("04e7a5dba7eaf851fa77529493ca6cbeafcf573abed87c4864c830c2b0d0a913111739a7581c993e4256b59872d7e45bf894554b4b4520a4339de898ab4fab9284") << OP_CHECKSIG;
+
+        txNew[131].vin.resize(1);
+        txNew[131].vout.resize(1);
+        txNew[131].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[131].vout[0].nValue = 100662.78903196 * COIN;
+        txNew[131].vout[0].scriptPubKey = CScript() << ParseHex("04e8ca8906663f47b1706ea5fd880ffc4f01a0e63ef676eb893bde5efb676cd44795b75812e146245c54c9e47d90ce1ae4762a57cab691ab1cd463f6dd67e2203f") << OP_CHECKSIG;
+
+        txNew[132].vin.resize(1);
+        txNew[132].vout.resize(1);
+        txNew[132].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[132].vout[0].nValue = 67875.48060441 * COIN;
+        txNew[132].vout[0].scriptPubKey = CScript() << ParseHex("044e0c6fa6fb923fb0a99671aa69dc7978db612fa7c2d3f40f99bda1d0b6943a68526c0ec2c799fb330a09b2cf65fd68d0dc7d6c3af1765588d094cdb7723a6a4c") << OP_CHECKSIG;
+
+        txNew[133].vin.resize(1);
+        txNew[133].vout.resize(1);
+        txNew[133].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[133].vout[0].nValue = 14380.39843314 * COIN;
+        txNew[133].vout[0].scriptPubKey = CScript() << ParseHex("04e8ca8906663f47b1706ea5fd880ffc4f01a0e63ef676eb893bde5efb676cd44795b75812e146245c54c9e47d90ce1ae4762a57cab691ab1cd463f6dd67e2203f") << OP_CHECKSIG;
+
+        txNew[134].vin.resize(1);
+        txNew[134].vout.resize(1);
+        txNew[134].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[134].vout[0].nValue = 10411.40846559 * COIN;
+        txNew[134].vout[0].scriptPubKey = CScript() << ParseHex("04531f47502eb2cbdded88867247c97803db43a478b1267b14b30ce8c2604335fddc4b6b42c10d4ce5b05b3f5bba9cdb1a6005244717f48a3bb0b205134c910894") << OP_CHECKSIG;
+
+        txNew[135].vin.resize(1);
+        txNew[135].vout.resize(1);
+        txNew[135].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[135].vout[0].nValue = 1438.03984331 * COIN;
+        txNew[135].vout[0].scriptPubKey = CScript() << ParseHex("04e8ca8906663f47b1706ea5fd880ffc4f01a0e63ef676eb893bde5efb676cd44795b75812e146245c54c9e47d90ce1ae4762a57cab691ab1cd463f6dd67e2203f") << OP_CHECKSIG;
+
+        txNew[136].vin.resize(1);
+        txNew[136].vout.resize(1);
+        txNew[136].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[136].vout[0].nValue = 5752.15937325 * COIN;
+        txNew[136].vout[0].scriptPubKey = CScript() << ParseHex("04e542e7856f1427942f550acb028ef68a13e42d7380c1bb1554279cf68410aac6770bc6b2fe7db863c3718aea989ce5d53d586f7be5f086a58b897adc1198ef7f") << OP_CHECKSIG;
+
+        txNew[137].vin.resize(1);
+        txNew[137].vout.resize(1);
+        txNew[137].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[137].vout[0].nValue = 5752.15937325 * COIN;
+        txNew[137].vout[0].scriptPubKey = CScript() << ParseHex("0411e1993a1656742e28272a8e67693fd03f7e12843f2e22f49ee5d1b6f77700f4acf9459994d9f3ae919b136f6b0bc83a482f341067c2e1056f0baebdea718570") << OP_CHECKSIG;
+
+        txNew[138].vin.resize(1);
+        txNew[138].vout.resize(1);
+        txNew[138].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[138].vout[0].nValue = 5737.77897482 * COIN;
+        txNew[138].vout[0].scriptPubKey = CScript() << ParseHex("04b9e3002aaab7b712d37d4a94d1ac2c20fc13e31728f28b790b5aacefdca2b3dba54a6a5c7cdc2c7c26abf90fa89ce841ef627468548e2e8563cc1b75cd54abe1") << OP_CHECKSIG;
+
+        txNew[139].vin.resize(1);
+        txNew[139].vout.resize(1);
+        txNew[139].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[139].vout[0].nValue = 43141.19529941 * COIN;
+        txNew[139].vout[0].scriptPubKey = CScript() << ParseHex("04f08bf2890cfb78eeb6c7cc503241da9560609074214a85f6a30101e07c61228b9dd20b0c07c9b91bec7575e8af1e72bfc7db0dd14edb802ab8eeefa5c24ba725") << OP_CHECKSIG;
+
+        txNew[140].vin.resize(1);
+        txNew[140].vout.resize(1);
+        txNew[140].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[140].vout[0].nValue = 5752.15937325 * COIN;
+        txNew[140].vout[0].scriptPubKey = CScript() << ParseHex("04b7d8bea1c1c197e6b9e6af7309562494ac360b9f792503fb1fae1fb70176fbebcec7320646c676841d28403c24ae9e5fab25eee44d4b04e17155b248571e211c") << OP_CHECKSIG;
+
+        txNew[141].vin.resize(1);
+        txNew[141].vout.resize(1);
+        txNew[141].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[141].vout[0].nValue = 287.60796866 * COIN;
+        txNew[141].vout[0].scriptPubKey = CScript() << ParseHex("047b126b838418348e4393f32ce2246c4048f7be27ca413a1a22156ae9fb6085d916913534148c1b535c5746245703441f40fa5df4c042eb3ed3c61476a896a3b4") << OP_CHECKSIG;
+
+        txNew[142].vin.resize(1);
+        txNew[142].vout.resize(1);
+        txNew[142].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[142].vout[0].nValue = 7190.19921657 * COIN;
+        txNew[142].vout[0].scriptPubKey = CScript() << ParseHex("04bb29821c0249da97df15f291860fc36947c914847c628460e362a6b705a5b61fc751cbb5f40bdb8ce8c340558141a198898c28c00aa5a4c5f6a15692709cf445") << OP_CHECKSIG;
+
+        txNew[143].vin.resize(1);
+        txNew[143].vout.resize(1);
+        txNew[143].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[143].vout[0].nValue = 2323.87238679 * COIN;
+        txNew[143].vout[0].scriptPubKey = CScript() << ParseHex("046e965a2e40d0861ecf3d3dad1a5d858224ddd91631477d4d9bb274abc54d2f257d93f5db69092d2edb2d1487c59b0dbf0a68e02044049d0f332a79d7d1a6e472") << OP_CHECKSIG;
+
+        txNew[144].vin.resize(1);
+        txNew[144].vout.resize(1);
+        txNew[144].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[144].vout[0].nValue = 719.01992166 * COIN;
+        txNew[144].vout[0].scriptPubKey = CScript() << ParseHex("04346f80651a3e3eb9afd55b608e77242e8826af1f0d9b96174314d0f288a50f27777eaeca67b5b3349207a798c847bcbecf0d9dc869fbb4102ad333b34bffa17a") << OP_CHECKSIG;
+
+        txNew[145].vin.resize(1);
+        txNew[145].vout.resize(1);
+        txNew[145].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[145].vout[0].nValue = 575.21593733 * COIN;
+        txNew[145].vout[0].scriptPubKey = CScript() << ParseHex("0415a65e0c4bea9f00f98729fd03cf9e68bd8b15a9c10ec0b52f8c9c3a88221e7a213d7259ba76c3a8c6505c5af6956cc9aa882ff4dee3c27dd758933bab8ec716") << OP_CHECKSIG;
+
+        txNew[146].vin.resize(1);
+        txNew[146].vout.resize(1);
+        txNew[146].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[146].vout[0].nValue = 6341.15173228 * COIN;
+        txNew[146].vout[0].scriptPubKey = CScript() << ParseHex("040a54ac2761d7fcdbae5e1e75bfdb01022b49b628046b10058ab6658f60ea7ef7daa0b60d2a0a1a9792bb1b3c12139152590b1b9e7f2cb8746554bc2781118763") << OP_CHECKSIG;
+
+        txNew[147].vin.resize(1);
+        txNew[147].vout.resize(1);
+        txNew[147].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[147].vout[0].nValue = 2387.1461399 * COIN;
+        txNew[147].vout[0].scriptPubKey = CScript() << ParseHex("041ca665c8ac5e2e1bc08a75fba60e133b19ef71d82a5af7194fd5a7ebea939d55ef11918ac054a0301a7679b49b27095d7840890b5c3b7ae8fd323a6e4967b494") << OP_CHECKSIG;
+
+        txNew[148].vin.resize(1);
+        txNew[148].vout.resize(1);
+        txNew[148].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[148].vout[0].nValue = 1207.55426852 * COIN;
+        txNew[148].vout[0].scriptPubKey = CScript() << ParseHex("047e1ef77a78977f6a720e9fd223ec98e15ed90bef91629b50d1ddb54a673c1a5614017c99be29906d25d7a5eb46aaca338cc6da72e350a2f60ba94b6dadc4f7e6") << OP_CHECKSIG;
+
+        txNew[149].vin.resize(1);
+        txNew[149].vout.resize(1);
+        txNew[149].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[149].vout[0].nValue = 23401.80218791 * COIN;
+        txNew[149].vout[0].scriptPubKey = CScript() << ParseHex("0489a8c6303ecd9d57bea0ae43c1569f0af6b35fd3c46bcff5c07951f977a63c47f65e04648cba855862424f9998bffa75d16039895bfe65ea9024b593bcb29633") << OP_CHECKSIG;
+
+        txNew[150].vin.resize(1);
+        txNew[150].vout.resize(1);
+        txNew[150].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[150].vout[0].nValue = 5749.28329357 * COIN;
+        txNew[150].vout[0].scriptPubKey = CScript() << ParseHex("0417a02a907d733f979cdf9faab2a2fabbe6268ef71b41c90c144402de2df1266237a285d8dad5ed0c5b64379efe43d41159b9170db97c64f8308cb07e0ed9b3b6") << OP_CHECKSIG;
+
+        txNew[151].vin.resize(1);
+        txNew[151].vout.resize(1);
+        txNew[151].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[151].vout[0].nValue = 712.69254635 * COIN;
+        txNew[151].vout[0].scriptPubKey = CScript() << ParseHex("040d28239553f559908f2b5c9797123e0e274df944ec2ae79bafd72e9e4c28a2d33d69ddc5b3fd92b8d2e402255026ebcd4eb85016704dc72fa42767d97c3f85ac") << OP_CHECKSIG;
+
+        txNew[152].vin.resize(1);
+        txNew[152].vout.resize(1);
+        txNew[152].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[152].vout[0].nValue = 1348.88137303 * COIN;
+        txNew[152].vout[0].scriptPubKey = CScript() << ParseHex("047e1ef77a78977f6a720e9fd223ec98e15ed90bef91629b50d1ddb54a673c1a5614017c99be29906d25d7a5eb46aaca338cc6da72e350a2f60ba94b6dadc4f7e6") << OP_CHECKSIG;
+
+        txNew[153].vin.resize(1);
+        txNew[153].vout.resize(1);
+        txNew[153].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[153].vout[0].nValue = 11504.31874651 * COIN;
+        txNew[153].vout[0].scriptPubKey = CScript() << ParseHex("0449a635966ae8b1bb4268384554d1ca65ff7b4bb4e08b1ecbbbf8f5ba05fac04297d0e627ab30468cccc112e7511fd318cde54c1d01edff9f95bb06ef160568a8") << OP_CHECKSIG;
+
+        txNew[154].vin.resize(1);
+        txNew[154].vout.resize(1);
+        txNew[154].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[154].vout[0].nValue = 7190.19921657 * COIN;
+        txNew[154].vout[0].scriptPubKey = CScript() << ParseHex("0442783dee2c92694129dafd9f8e18da3b237f0b880ab475ec14118f1fa116265a852fe0096a29e43142cda0b4887ab4f68353139e3ebf3ed5ae5ad630efe17e9b") << OP_CHECKSIG;
+
+        txNew[155].vin.resize(1);
+        txNew[155].vout.resize(1);
+        txNew[155].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[155].vout[0].nValue = 295.5387584 * COIN;
+        txNew[155].vout[0].scriptPubKey = CScript() << ParseHex("0422c93d26ac789c86b986e1b56c3df9fe9a774a3dc3b40e185a6b0fc9eb5989f00401fdee0d3182ade6b32d97eec07c59318236c3be13f787eef72af9a8906787") << OP_CHECKSIG;
+
+        txNew[156].vin.resize(1);
+        txNew[156].vout.resize(1);
+        txNew[156].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[156].vout[0].nValue = 862.82390599 * COIN;
+        txNew[156].vout[0].scriptPubKey = CScript() << ParseHex("04fe02e611c7576cea9477e8dc095388c927907b5d7da5f8c66c7e693036b687cf5d916296499a6d5620c563639ac665b721065e3c84276b9ed62d10598fa3a90c") << OP_CHECKSIG;
+
+        txNew[157].vin.resize(1);
+        txNew[157].vout.resize(1);
+        txNew[157].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[157].vout[0].nValue = 2876.07968663 * COIN;
+        txNew[157].vout[0].scriptPubKey = CScript() << ParseHex("04c2dfef238182894485bc9ed7573b9929a6b50e3103117b5385c018ece6dbc9c7203a8684e63a6a0769df77934e111b45a486a6aa14bbe89128db4e1486c629c6") << OP_CHECKSIG;
+
+        txNew[158].vin.resize(1);
+        txNew[158].vout.resize(1);
+        txNew[158].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[158].vout[0].nValue = 1998.87538221 * COIN;
+        txNew[158].vout[0].scriptPubKey = CScript() << ParseHex("04c0c527d90d8a6f9966245d133ceea071ad38f833b9da9d72b37bfa9d954429a620c020ef92f18c7796ad6b19318126c50fff1ea86c1793a0ff2e986bd8dcae88") << OP_CHECKSIG;
+
+        txNew[159].vin.resize(1);
+        txNew[159].vout.resize(1);
+        txNew[159].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[159].vout[0].nValue = 287.60796866 * COIN;
+        txNew[159].vout[0].scriptPubKey = CScript() << ParseHex("04bc799b964af579ed31386b8db94af932818bc2c74750dede794a2a9b874d3796156b90c4654d0711c0c495c634358f110eafc44e3c5303850cab624072522598") << OP_CHECKSIG;
+
+        txNew[160].vin.resize(1);
+        txNew[160].vout.resize(1);
+        txNew[160].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[160].vout[0].nValue = 575.21593733 * COIN;
+        txNew[160].vout[0].scriptPubKey = CScript() << ParseHex("04a35ab81c5aa75e4fcd5e4afac20eb5821cad14f78085eb92ef9c0ff416ca838d31f727750ce82daf5412e4b08b9c4f1916cdac7aac0cffe20cb84639ee7da633") << OP_CHECKSIG;
+
+        txNew[161].vin.resize(1);
+        txNew[161].vout.resize(1);
+        txNew[161].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[161].vout[0].nValue = 14380.39843314 * COIN;
+        txNew[161].vout[0].scriptPubKey = CScript() << ParseHex("04840fa1ee36bacfb8f5cdfbf6f02eb3232f7c42e71052a420583c41582b807fff51550b94808c351f3ee37216a81753772da58fb8e03be6c505d0f96ca536281b") << OP_CHECKSIG;
+
+        txNew[162].vin.resize(1);
+        txNew[162].vout.resize(1);
+        txNew[162].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[162].vout[0].nValue = 2861.65902308 * COIN;
+        txNew[162].vout[0].scriptPubKey = CScript() << ParseHex("04842161c2818fcd5d69a16d1e02734eb340f2603f46abe0f4126cda910824cbde90f5b2c1fdcd5530fb8e59db91daa8b648d55452f9085d0f3281b75b9687778e") << OP_CHECKSIG;
+
+        txNew[163].vin.resize(1);
+        txNew[163].vout.resize(1);
+        txNew[163].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[163].vout[0].nValue = 1438.03984331 * COIN;
+        txNew[163].vout[0].scriptPubKey = CScript() << ParseHex("04e0b1f64296a3180a26bcc6fcdc4d9d2edf91668fdeb9e63c5eb10f921f65e994f3019046b42faccc5c0a87cb98361d01c755a83e88fb1088da69a3e37fc67e32") << OP_CHECKSIG;
+
+        txNew[164].vin.resize(1);
+        txNew[164].vout.resize(1);
+        txNew[164].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[164].vout[0].nValue = 6672.50487298 * COIN;
+        txNew[164].vout[0].scriptPubKey = CScript() << ParseHex("04c0c527d90d8a6f9966245d133ceea071ad38f833b9da9d72b37bfa9d954429a620c020ef92f18c7796ad6b19318126c50fff1ea86c1793a0ff2e986bd8dcae88") << OP_CHECKSIG;
+
+        txNew[165].vin.resize(1);
+        txNew[165].vout.resize(1);
+        txNew[165].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[165].vout[0].nValue = 7190.19921657 * COIN;
+        txNew[165].vout[0].scriptPubKey = CScript() << ParseHex("04c4ffb3b773dc2578ec917d85914b9318cdef0ec90e77d527629d0f938f3c00e1ec3c729208dc325d0c851ea7428879ca01e7f22e227fc3ee435bf5a8985ecc14") << OP_CHECKSIG;
+
+        txNew[166].vin.resize(1);
+        txNew[166].vout.resize(1);
+        txNew[166].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[166].vout[0].nValue = 287.60796866 * COIN;
+        txNew[166].vout[0].scriptPubKey = CScript() << ParseHex("0436ce6c13a201a59bb5a43d76fd7a7aa8c19ac63fc195b67697a5c8435870e79e67620c6f70a2eb43ba55e419e24ff443e5c0bd89c808edc9d86803cbf41d0771") << OP_CHECKSIG;
+
+        txNew[167].vin.resize(1);
+        txNew[167].vout.resize(1);
+        txNew[167].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[167].vout[0].nValue = 14386.15059251 * COIN;
+        txNew[167].vout[0].scriptPubKey = CScript() << ParseHex("0407108ffbdf64d3620424b05ea9434942def144d5359b5bee4ca1f1a27df7fa1fab48477399a71588db0f57c7d37a11b117a95d42db67a936ed4c7eb569f70d7b") << OP_CHECKSIG;
+
+        txNew[168].vin.resize(1);
+        txNew[168].vout.resize(1);
+        txNew[168].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[168].vout[0].nValue = 5752.15937325 * COIN;
+        txNew[168].vout[0].scriptPubKey = CScript() << ParseHex("041b5f6fc0a4f58010692aea3e5c67beaf930a9e4a173d81889320b02fdde2b086b315ad9aa1a45ce2786484bfab1e99665874a71db4929c7462700b642e53d342") << OP_CHECKSIG;
+
+        txNew[169].vin.resize(1);
+        txNew[169].vout.resize(1);
+        txNew[169].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[169].vout[0].nValue = 5752.15937325 * COIN;
+        txNew[169].vout[0].scriptPubKey = CScript() << ParseHex("0496d0c782bac98a6362919c7e4c4536b49b14baa83908c37441952f9ce9c2733c7d586665928297d34d5e12e8a0883615e7b5dacd7d6eb4a47d60092affba1ea9") << OP_CHECKSIG;
+
+        txNew[170].vin.resize(1);
+        txNew[170].vout.resize(1);
+        txNew[170].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[170].vout[0].nValue = 575215.93732547 * COIN;
+        txNew[170].vout[0].scriptPubKey = CScript() << ParseHex("0452955f4a625684fd2899f307fa87fad2f6acb369cb75c5583de88b37b81e7a830337fe358d845695ccb96359f2715b934d3f697c67dd6d596a0eace00aa1ae4b") << OP_CHECKSIG;
+
+        txNew[171].vin.resize(1);
+        txNew[171].vout.resize(1);
+        txNew[171].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[171].vout[0].nValue = 28760.79686627 * COIN;
+        txNew[171].vout[0].scriptPubKey = CScript() << ParseHex("0481528349984d04bab49119be7f870ac8253c79545c9e7593ce8d564e137e5ef2adf2d0b556715f6dba65f19349d3a5d0c0b11addf83c692fc2c3a0fd38dc2891") << OP_CHECKSIG;
+
+        txNew[172].vin.resize(1);
+        txNew[172].vout.resize(1);
+        txNew[172].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[172].vout[0].nValue = 300000 * COIN;
+        txNew[172].vout[0].scriptPubKey = CScript() << ParseHex("048733c0bd937b9751a899adb843c495fbb264d617d0b2eb23307540ff9a68be76ce5260af2284d7afbcf585bd365324711fb62e2b5ab0c543bdf2f93f400bdd6f") << OP_CHECKSIG;
+
+        txNew[173].vin.resize(1);
+        txNew[173].vout.resize(1);
+        txNew[173].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[173].vout[0].nValue = 400000 * COIN;
+        txNew[173].vout[0].scriptPubKey = CScript() << ParseHex("049918fa3d8e0c24ea09b45aab531ec863c140af86041bedf45a86f8b764d0d8a621fcd7f368cb28c49c962d144f8a82119ee7357106bf70c1609c7ac0b07ed355") << OP_CHECKSIG;
+
+        txNew[174].vin.resize(1);
+        txNew[174].vout.resize(1);
+        txNew[174].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[174].vout[0].nValue = 200000 * COIN;
+        txNew[174].vout[0].scriptPubKey = CScript() << ParseHex("04af75f183c45a3aa35289aa83ec5a3b3d863b4bfab96b8c530243bdc34b3ac5a20e2fa90cc621b66f9f49d2b4167599f030e5c90ffc15477ca44ad1b49ca76fb4") << OP_CHECKSIG;
+
+        txNew[175].vin.resize(1);
+        txNew[175].vout.resize(1);
+        txNew[175].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[175].vout[0].nValue = 100000 * COIN;
+        txNew[175].vout[0].scriptPubKey = CScript() << ParseHex("04b2c904ae2200ebe763b447545324f5e1ff548fd55c1160555aa6c2f9926527fab2f49c2649190ae3031a8e7a058b7fd610fae2518b3a0e15621cb0d7dc1783bb") << OP_CHECKSIG;
+
+        txNew[176].vin.resize(1);
+        txNew[176].vout.resize(1);
+        txNew[176].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[176].vout[0].nValue = 400000 * COIN;
+        txNew[176].vout[0].scriptPubKey = CScript() << ParseHex("042d29cf124cc46489dc919d5388911da116a18a1dda5796af25cadcff8c39defb9b206adf970320687d30b7bdfdcab6f3f9f3a74521c9246c7a56508f6154077c") << OP_CHECKSIG;
+
+        txNew[177].vin.resize(1);
+        txNew[177].vout.resize(1);
+        txNew[177].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[177].vout[0].nValue = 100000 * COIN;
+        txNew[177].vout[0].scriptPubKey = CScript() << ParseHex("045a45b7df792261ed0f53eb0eda2e611ef82e7faad7376864f03be048f241f896240e927318afd41d62d9154d1c73a519f3f338080697af81786037c49fe5218f") << OP_CHECKSIG;
+
+        txNew[178].vin.resize(1);
+        txNew[178].vout.resize(1);
+        txNew[178].vin[0].scriptSig = CScript() << 486604799 << CBigNum(4) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew[178].vout[0].nValue = 1500000 * COIN + 18; // Padding for microscopic rounding errors to get an even 8M
+        txNew[178].vout[0].scriptPubKey = CScript() << ParseHex("041e6837fde1a4fc30136d0835657e72a4d8dcc12a899817cc959e1956d5b361d0d4dd834a93e1ffa68b300375fa8055ba0dcbc0932f29e4fbad68192e34bcc2a7") << OP_CHECKSIG;
+
+        int64 sum = 0;
         CBlock block;
-        block.vtx.push_back(txNew);
+        for (int i = 0; i < 179; i++) {
+            sum += txNew[i].vout[0].nValue;
+            block.vtx.push_back(txNew[i]);
+        }
+
+        printf("Genesis block sum = %"PRI64d"\n", sum);
+        assert(sum/COIN == 8000000);
+
         block.hashPrevBlock = 0;
         block.hashMerkleRoot = block.BuildMerkleTree();
-        block.nVersion = 1;
-        block.nTime    = 1231006505;
-        block.nBits    = 0x1d00ffff;
-        block.nNonce   = 2083236893;
+        block.setVersion(1);
+        block.setSupply(sum/COIN);
+        block.nTime    = 1394274360;
+        block.nBits    = 0x1e1fffe0; // HEFTY1 is very expensive, so starts with lower difficulty
+        block.nNonce   = 2102389708;
+        block.nReward  = 0; /* Starting block reward */
 
         if (fTestNet)
         {
-            block.nTime    = 1296688602;
-            block.nNonce   = 414098458;
+            block.nTime  = 1394274360;
+            block.nNonce = 2657063146;
         }
 
         //// debug print
+        printf("merkle prehash  %s\n", block.hashMerkleRoot.ToString().c_str());
         uint256 hash = block.GetHash();
-        printf("%s\n", hash.ToString().c_str());
-        printf("%s\n", hashGenesisBlock.ToString().c_str());
-        printf("%s\n", block.hashMerkleRoot.ToString().c_str());
-        assert(block.hashMerkleRoot == uint256("0x4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"));
+        printf("hash    0x%s\n", hash.ToString().c_str());
+        printf("genesis 0x%s\n", hashGenesisBlock.ToString().c_str());
+        printf("merkle  0x%s\n", block.hashMerkleRoot.ToString().c_str());
+
+        assert(block.getSupply() == 8000000);
+        assert(block.hashMerkleRoot
+               == uint256("0x708bd24bf8a6e599ec6d74d893dfb4f2c32beeabce41f16c401adb691921d557"));
+
+        // If genesis block hash does not match, then generate new genesis hash.
+        if (false && block.GetHash() != hashGenesisBlock)
+        {
+            uint256 hashTarget = CBigNum().SetCompact(block.nBits).getuint256();
+            printf("* Mining genesis block...\n");
+            printf("    Target %s\n", hashTarget.ToString().c_str());
+
+            // This will figure out a valid hash and Nonce if you're
+            // creating a different genesis block:
+            uint64 nStart = GetTimeMillis();
+            uint256 thash;
+            loop
+            {
+                thash = block.GetHash();
+                if (thash <= hashTarget)
+                    break;
+                if ((block.nNonce & 0xFFFFF) == 0)
+                {
+                    printf("    Search: nonce %08x hash %s\n",
+                           block.nNonce, thash.ToString().c_str());
+                }
+                ++block.nNonce;
+                if (block.nNonce == 0)
+                {
+                    printf("    Nonce wrapped: incrementing time\n");
+                    ++block.nTime;
+                }
+            }
+
+            if (CheckProofOfWork(thash, block.nBits)) {
+                printf("* Solved genesis block! nonce %u hash 0x%s time %u\n",
+                       block.nNonce, thash.ToString().c_str(), block.nTime);
+                printf("* Mining took %"PRI64d" minutes\n", (GetTimeMillis() - nStart)/60000);
+            }
+        }
+
         block.print();
         assert(hash == hashGenesisBlock);
 
@@ -3595,6 +4971,23 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
         int nDoS;
         if (state.IsInvalid(nDoS))
             pfrom->Misbehaving(nDoS);
+        else {
+            LogBlock(block);
+
+            // Adjust block reward vote limit
+            AdjustBlockRewardVoteLimit(pindexBest);
+
+            // Calculate the average block time
+            CBigNum bnUnused; float nUnused, nAvgTimespan;
+            CalcWindowedAvgs(pindexBest, nDiffWindow, 0,
+                             AbsTime((int64)block.nTime, pindexBest->GetBlockTime()),
+                             bnUnused, nAvgTimespan, nUnused);
+
+            pvoteMain->UpdateParams((unsigned int)pindexBest->nHeight, nAvgTimespan,
+                                    nBlockRewardVoteSpan, GetCurrentBlockReward(pindexBest),
+                                    GetNextBlockReward(pindexBest), nBlockRewardVoteLimit,
+                                    nPhase, pindexBest->getSupply(), nTarget, nMaxSupply);
+        }
     }
 
 
@@ -4029,22 +5422,9 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
     return true;
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
 //////////////////////////////////////////////////////////////////////////////
 //
-// BitcoinMiner
+// HeavycoinMiner
 //
 
 int static FormatHashBlocks(void* pbuffer, unsigned int len)
@@ -4062,59 +5442,59 @@ int static FormatHashBlocks(void* pbuffer, unsigned int len)
     return blocks;
 }
 
-static const unsigned int pSHA256InitState[8] =
-{0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
-
-void SHA256Transform(void* pstate, void* pinput, const void* pinit)
+void SHA256Transform(void* pstate, void* pdata, const void* pinit)
 {
     SHA256_CTX ctx;
     unsigned char data[64];
 
     SHA256_Init(&ctx);
 
-    for (int i = 0; i < 16; i++)
-        ((uint32_t*)data)[i] = ByteReverse(((uint32_t*)pinput)[i]);
+    if (pinit)
+    {
+        for (int i = 0; i < 8; i++)
+            ctx.h[i] = ((uint32_t*)pinit)[i];
+    }
 
-    for (int i = 0; i < 8; i++)
-        ctx.h[i] = ((uint32_t*)pinit)[i];
+    for (size_t i = 0; i < 16; i++)
+        ((uint32_t*)data)[i] = ByteReverse(((uint32_t*)pdata)[i]);
 
     SHA256_Update(&ctx, data, sizeof(data));
+
     for (int i = 0; i < 8; i++)
         ((uint32_t*)pstate)[i] = ctx.h[i];
 }
 
-//
-// ScanHash scans nonces looking for a hash with at least some zero bits.
-// It operates on big endian data.  Caller does the byte reversing.
-// All input buffers are 16-byte aligned.  nNonce is usually preserved
-// between calls, but periodically or if nNonce is 0xffff0000 or above,
-// the block is rebuilt and nNonce starts over at zero.
-//
-unsigned int static ScanHash_CryptoPP(char* pmidstate, char* pdata, char* phash1, char* phash, unsigned int& nHashesDone)
+void HEFTY1Transform(void* pstate, uint32_t *spongeOut, void* pinput,
+                     const void* pinit, uint32_t* spongeIn)
 {
-    unsigned int& nNonce = *(unsigned int*)(pdata + 12);
-    for (;;)
+    HEFTY1_CTX ctx;
+    unsigned char data[64];
+
+    HEFTY1_Init(&ctx);
+
+    for (int i = 0; i < 16; i++)
+        ((uint32_t*)data)[i] = ByteReverse(((uint32_t*)pinput)[i]);
+
+    if (pinit)
     {
-        // Crypto++ SHA256
-        // Hash pdata using pmidstate as the starting state into
-        // pre-formatted buffer phash1, then hash phash1 into phash
-        nNonce++;
-        SHA256Transform(phash1, pdata, pmidstate);
-        SHA256Transform(phash, phash1, pSHA256InitState);
+        for (int i = 0; i < 8; i++)
+            ctx.h[i] = ((uint32_t*)pinit)[i];
+    }
 
-        // Return the nonce if the hash has at least some zero bits,
-        // caller will check if it has enough to reach the target
-        if (((unsigned short*)phash)[14] == 0)
-            return nNonce;
+    if (spongeIn)
+    {
+        for (int i = 0; i < HEFTY1_SPONGE_WORDS; i++)
+            ctx.sponge[i] = spongeIn[i];
+    }
 
-        // If nothing found after trying for a while, return -1
-        if ((nNonce & 0xffff) == 0)
-        {
-            nHashesDone = 0xffff+1;
-            return (unsigned int) -1;
-        }
-        if ((nNonce & 0xfff) == 0)
-            boost::this_thread::interruption_point();
+    HEFTY1_Update(&ctx, data, sizeof(data));
+    for (int i = 0; i < 8; i++)
+        ((uint32_t*)pstate)[i] = ctx.h[i];
+
+    if (spongeOut)
+    {
+        for (int i = 0; i < HEFTY1_SPONGE_WORDS; i++)
+            spongeOut[i] = ctx.sponge[i];
     }
 }
 
@@ -4393,14 +5773,26 @@ CBlockTemplate* CreateNewBlock(CReserveKey& reservekey)
         nLastBlockSize = nBlockSize;
         printf("CreateNewBlock(): total size %"PRI64u"\n", nBlockSize);
 
-        pblock->vtx[0].vout[0].nValue = GetBlockValue(pindexPrev->nHeight+1, nFees);
+        pblock->nReward = GetCurrentBlockReward(pindexPrev);
+        if (pblock->nReward + pindexPrev->getSupply() > nMaxSupply) {
+            pblock->nReward = nMaxSupply - pindexPrev->getSupply();
+            printf("Vote: Limiting current block reward to %hu\n", pblock->nReward);
+        }
+        pblock->vtx[0].vout[0].nValue = GetBlockValue(pblock->nReward,
+                                                      pindexPrev->nHeight + 1, nFees);
         pblocktemplate->vTxFees[0] = -nFees;
+
+        // Set next money supply
+        pblock->setSupply(pindexPrev->getSupply() + pblock->nReward);
 
         // Fill in header
         pblock->hashPrevBlock  = pindexPrev->GetBlockHash();
         pblock->UpdateTime(pindexPrev);
         pblock->nBits          = GetNextWorkRequired(pindexPrev, pblock);
         pblock->nNonce         = 0;
+        if (nBlockRewardVote > nBlockRewardVoteLimit)
+            nBlockRewardVote = nBlockRewardVoteLimit;
+        pblock->nVote          = nBlockRewardVote;
         pblock->vtx[0].vin[0].scriptSig = CScript() << OP_0 << OP_0;
         pblocktemplate->vTxSigOps[0] = pblock->vtx[0].GetLegacySigOpCount();
 
@@ -4434,8 +5826,9 @@ void IncrementExtraNonce(CBlock* pblock, CBlockIndex* pindexPrev, unsigned int& 
     pblock->hashMerkleRoot = pblock->BuildMerkleTree();
 }
 
-
-void FormatHashBuffers(CBlock* pblock, char* pmidstate, char* pdata, char* phash1)
+// Time precludes scanhash implemention, so provide a simple
+// implementation for RPC mining
+void FormatHashBuffers(CBlock* pblock, char* pdata)
 {
     //
     // Pre-build hash buffers
@@ -4450,6 +5843,8 @@ void FormatHashBuffers(CBlock* pblock, char* pmidstate, char* pdata, char* phash
             unsigned int nTime;
             unsigned int nBits;
             unsigned int nNonce;
+            uint16_t nVote;
+            uint16_t nReward;
         }
         block;
         unsigned char pchPadding0[64];
@@ -4465,21 +5860,14 @@ void FormatHashBuffers(CBlock* pblock, char* pmidstate, char* pdata, char* phash
     tmp.block.nTime          = pblock->nTime;
     tmp.block.nBits          = pblock->nBits;
     tmp.block.nNonce         = pblock->nNonce;
+    tmp.block.nVote         = pblock->nVote;
+    tmp.block.nReward       = pblock->nReward;
 
     FormatHashBlocks(&tmp.block, sizeof(tmp.block));
     FormatHashBlocks(&tmp.hash1, sizeof(tmp.hash1));
 
-    // Byte swap all the input buffer
-    for (unsigned int i = 0; i < sizeof(tmp)/4; i++)
-        ((unsigned int*)&tmp)[i] = ByteReverse(((unsigned int*)&tmp)[i]);
-
-    // Precalc the first half of the first hash, which stays constant
-    SHA256Transform(pmidstate, &tmp.block, pSHA256InitState);
-
     memcpy(pdata, &tmp.block, 128);
-    memcpy(phash1, &tmp.hash1, 64);
 }
-
 
 bool CheckWork(CBlock* pblock, CWallet& wallet, CReserveKey& reservekey)
 {
@@ -4490,8 +5878,10 @@ bool CheckWork(CBlock* pblock, CWallet& wallet, CReserveKey& reservekey)
         return false;
 
     //// debug print
-    printf("BitcoinMiner:\n");
-    printf("proof-of-work found  \n  hash: %s  \ntarget: %s\n", hash.GetHex().c_str(), hashTarget.GetHex().c_str());
+    printf("proof-of-work found: difficulty %g tx %s\n  hash: %s  \ntarget: %s\n",
+           GetDifficulty(pindexBest),
+           pblock->hashMerkleRoot.ToString().c_str(),
+           hash.GetHex().c_str(), hashTarget.GetHex().c_str());
     pblock->print();
     printf("generated %s\n", FormatMoney(pblock->vtx[0].vout[0].nValue).c_str());
 
@@ -4499,7 +5889,7 @@ bool CheckWork(CBlock* pblock, CWallet& wallet, CReserveKey& reservekey)
     {
         LOCK(cs_main);
         if (pblock->hashPrevBlock != hashBestChain)
-            return error("BitcoinMiner : generated block is stale");
+            return error("generated block is stale");
 
         // Remove key from key pool
         reservekey.KeepKey();
@@ -4513,17 +5903,32 @@ bool CheckWork(CBlock* pblock, CWallet& wallet, CReserveKey& reservekey)
         // Process this block the same as if we had received it from another node
         CValidationState state;
         if (!ProcessBlock(state, NULL, pblock))
-            return error("BitcoinMiner : ProcessBlock, block not accepted");
+            return error("ProcessBlock, block not accepted");
+
+        LogBlock(*pblock);
+
+        AdjustBlockRewardVoteLimit(pindexBest);
+
+        // Calculate the average block time
+        CBigNum bnUnused; float nUnused, nAvgTimespan;
+        CalcWindowedAvgs(pindexBest, nDiffWindow, 0,
+                         AbsTime((int64)pblock->nTime, pindexBest->GetBlockTime()),
+                         bnUnused, nAvgTimespan, nUnused);
+
+        pvoteMain->UpdateParams((unsigned int)pindexBest->nHeight, nAvgTimespan,
+                                nBlockRewardVoteSpan, GetCurrentBlockReward(pindexBest),
+                                GetNextBlockReward(pindexBest), nBlockRewardVoteLimit,
+                                nPhase, pindexBest->getSupply(), nTarget, nMaxSupply);
     }
 
     return true;
 }
 
-void static BitcoinMiner(CWallet *pwallet)
+void static HeavycoinMiner(CWallet *pwallet)
 {
-    printf("BitcoinMiner started\n");
+    printf("HeavycoinMiner started\n");
     SetThreadPriority(THREAD_PRIORITY_LOWEST);
-    RenameThread("bitcoin-miner");
+    RenameThread("heavycoin-miner");
 
     // Each thread has its own key and counter
     CReserveKey reservekey(pwallet);
@@ -4545,57 +5950,36 @@ void static BitcoinMiner(CWallet *pwallet)
         CBlock *pblock = &pblocktemplate->block;
         IncrementExtraNonce(pblock, pindexPrev, nExtraNonce);
 
-        printf("Running BitcoinMiner with %"PRIszu" transactions in block (%u bytes)\n", pblock->vtx.size(),
+        printf("Running HeavycoinMiner with %"PRIszu" transactions in block (%u bytes)\n",
+               pblock->vtx.size(),
                ::GetSerializeSize(*pblock, SER_NETWORK, PROTOCOL_VERSION));
-
-        //
-        // Pre-build hash buffers
-        //
-        char pmidstatebuf[32+16]; char* pmidstate = alignup<16>(pmidstatebuf);
-        char pdatabuf[128+16];    char* pdata     = alignup<16>(pdatabuf);
-        char phash1buf[64+16];    char* phash1    = alignup<16>(phash1buf);
-
-        FormatHashBuffers(pblock, pmidstate, pdata, phash1);
-
-        unsigned int& nBlockTime = *(unsigned int*)(pdata + 64 + 4);
-        unsigned int& nBlockBits = *(unsigned int*)(pdata + 64 + 8);
-        unsigned int& nBlockNonce = *(unsigned int*)(pdata + 64 + 12);
-
 
         //
         // Search
         //
         int64 nStart = GetTime();
         uint256 hashTarget = CBigNum().SetCompact(pblock->nBits).getuint256();
-        uint256 hashbuf[2];
-        uint256& hash = *alignup<16>(hashbuf);
+        unsigned int nHashesDone = 0;
         loop
         {
-            unsigned int nHashesDone = 0;
-            unsigned int nNonceFound;
-
-            // Crypto++ SHA256
-            nNonceFound = ScanHash_CryptoPP(pmidstate, pdata + 64, phash1,
-                                            (char*)&hash, nHashesDone);
-
-            // Check if something found
-            if (nNonceFound != (unsigned int) -1)
+            uint256 hash = pblock->GetHash();
+            nHashesDone++;
+            if (hash < hashTarget)
             {
-                for (unsigned int i = 0; i < sizeof(hash)/4; i++)
-                    ((unsigned int*)&hash)[i] = ByteReverse(((unsigned int*)&hash)[i]);
-
-                if (hash <= hashTarget)
-                {
                     // Found a solution
-                    pblock->nNonce = ByteReverse(nNonceFound);
-                    assert(hash == pblock->GetHash());
+                    printf("Found block: %d %.8f %u %s %s\n",
+                           pindexPrev->nHeight + 1,
+                           (float)CalcDifficulty(pblock->nBits),
+                           nHashesDone, pblock->hashMerkleRoot.ToString().c_str(),
+                           pblock->GetHash().GetHex().c_str());
 
                     SetThreadPriority(THREAD_PRIORITY_NORMAL);
                     CheckWork(pblock, *pwalletMain, reservekey);
                     SetThreadPriority(THREAD_PRIORITY_LOWEST);
+
                     break;
-                }
             }
+            pblock->nNonce++;
 
             // Meter hashes/sec
             static int64 nHashCounter;
@@ -4605,7 +5989,7 @@ void static BitcoinMiner(CWallet *pwallet)
                 nHashCounter = 0;
             }
             else
-                nHashCounter += nHashesDone;
+                nHashCounter++;
             if (GetTimeMillis() - nHPSTimerStart > 4000)
             {
                 static CCriticalSection cs;
@@ -4617,10 +6001,10 @@ void static BitcoinMiner(CWallet *pwallet)
                         nHPSTimerStart = GetTimeMillis();
                         nHashCounter = 0;
                         static int64 nLogTime;
-                        if (GetTime() - nLogTime > 30 * 60)
+                        if (GetTime() - nLogTime > 10 * 60)
                         {
                             nLogTime = GetTime();
-                            printf("hashmeter %6.0f khash/s\n", dHashesPerSec/1000.0);
+                            printf("Hashmeter: %6.0f khash/s\n", dHashesPerSec/1000.0);
                         }
                     }
                 }
@@ -4630,38 +6014,54 @@ void static BitcoinMiner(CWallet *pwallet)
             boost::this_thread::interruption_point();
             if (vNodes.empty())
                 break;
-            if (nBlockNonce >= 0xffff0000)
+            if (pblock->nNonce > 0xFFFFF)
                 break;
             if (nTransactionsUpdated != nTransactionsUpdatedLast && GetTime() - nStart > 60)
                 break;
             if (pindexPrev != pindexBest)
                 break;
+            if (pblock->nVote != nBlockRewardVote) {
+                printf("Vote: Block reward vote changed (restart mining)\n");
+                break;
+            }
 
             // Update nTime every few seconds
             pblock->UpdateTime(pindexPrev);
-            nBlockTime = ByteReverse(pblock->nTime);
             if (fTestNet)
             {
                 // Changing pblock->nTime can change work required on testnet:
-                nBlockBits = ByteReverse(pblock->nBits);
                 hashTarget = CBigNum().SetCompact(pblock->nBits).getuint256();
             }
         }
     } }
     catch (boost::thread_interrupted)
     {
-        printf("BitcoinMiner terminated\n");
+        printf("HeavycoinMiner terminated\n");
         throw;
     }
+}
+
+void SetGenerateThreads(int nThreads)
+{
+    nGenerateThreads = nThreads;
+    if (nGenerateThreads < 0)
+        nGenerateThreads = boost::thread::hardware_concurrency();
+
+    std::ostringstream ss;
+    ss << nGenerateThreads;
+    mapArgs["-genproclimit"] = ss.str();
 }
 
 void GenerateBitcoins(bool fGenerate, CWallet* pwallet)
 {
     static boost::thread_group* minerThreads = NULL;
 
-    int nThreads = GetArg("-genproclimit", -1);
-    if (nThreads < 0)
-        nThreads = boost::thread::hardware_concurrency();
+    bGenerate = fGenerate;
+    mapArgs["-gen"] = bGenerate ? "1" : "0";
+
+    nGenerateThreads = GetArg("-genproclimit", -1);
+    if (nGenerateThreads < 0)
+        nGenerateThreads = boost::thread::hardware_concurrency();
 
     if (minerThreads != NULL)
     {
@@ -4670,12 +6070,12 @@ void GenerateBitcoins(bool fGenerate, CWallet* pwallet)
         minerThreads = NULL;
     }
 
-    if (nThreads == 0 || !fGenerate)
+    if (nGenerateThreads == 0 || !fGenerate)
         return;
 
     minerThreads = new boost::thread_group();
-    for (int i = 0; i < nThreads; i++)
-        minerThreads->create_thread(boost::bind(&BitcoinMiner, pwallet));
+    for (int i = 0; i < nGenerateThreads; i++)
+        minerThreads->create_thread(boost::bind(&HeavycoinMiner, pwallet));
 }
 
 // Amount compression:
